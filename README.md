@@ -53,7 +53,7 @@ desfire_reader:
   address: 0x24
   update_interval: 1000ms
   app_id: "A1:B2:C3"
-  app_key:  "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"  # APP Key
+  app_key:  "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
   data_key: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"  # AES key to decrypt file data
   result:
     name: "Card Data"
