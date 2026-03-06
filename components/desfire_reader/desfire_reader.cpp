@@ -49,7 +49,7 @@ namespace esphome
       frame.push_back(dcs);
       frame.push_back(0x00); // POSTAMBLE
 
-      if (!this->write_bytes_raw(frame.data(), (uint8_t)frame.size()))
+      if (this->write(frame.data(), frame.size()) != i2c::ERROR_OK)
         return false;
 
       delay(2);
@@ -59,7 +59,7 @@ namespace esphome
       for (int retry = 0; retry < 20; retry++)
       {
         uint8_t buf[7] = {};
-        if (this->read_bytes_raw(buf, 7) && buf[0] == 0x01)
+        if (this->read(buf, 7) == i2c::ERROR_OK && buf[0] == 0x01)
         {
           return (buf[1] == 0x00 && buf[2] == 0x00 && buf[3] == 0xFF &&
                   buf[4] == 0x00 && buf[5] == 0xFF && buf[6] == 0x00);
@@ -85,7 +85,7 @@ namespace esphome
       for (int retry = 0; retry < 100; retry++)
       {
         uint8_t buf[64] = {};
-        if (this->read_bytes_raw(buf, sizeof(buf)) && buf[0] == 0x01)
+        if (this->read(buf, sizeof(buf)) == i2c::ERROR_OK && buf[0] == 0x01)
         {
           if (buf[6] != 0xD5 || buf[7] != command + 1)
             return false;
@@ -115,7 +115,7 @@ namespace esphome
       static const uint8_t wakeup[] = {
           0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
           0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-      this->write_bytes_raw(wakeup, sizeof(wakeup));
+      this->write(wakeup, sizeof(wakeup));
       delay(10);
 
       // SAMConfiguration: Normal mode (0x01), timeout=0x14, IRQ disabled (0x00)
