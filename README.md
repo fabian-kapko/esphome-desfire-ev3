@@ -48,16 +48,25 @@ i2c:
   scl: GPIO5
   scan: true
 
+external_components:
+  - source:
+      type: git 
+      url: https://github.com/fabian-kapko/esphome-desfire-ev3
+      ref: main
+          
 desfire_reader:
-  id: my_desfire
+  id: my_reader
   address: 0x24
-  update_interval: 1000ms
+  update_interval: 500ms
+
   app_id: "A1:B2:C3"
-  app_key:  "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
-  data_key: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"  # AES key to decrypt file data
+  app_key: "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+  data_key: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+
   result:
-    name: "Card Data"
+    name: "Card Result"
     id: card_data
+
   auth_ok:
     name: "Card Auth OK"
     id: card_auth
@@ -71,6 +80,8 @@ desfire_reader:
                   format: "Valid card: %s"
                   args: ["id(card_data).state.c_str()"]
 
+  uid:
+    name: "Card UID"
 ```
 
 ### Configuration variables
@@ -123,8 +134,7 @@ The card must have an application with:
 - **Key 0** matching `app_key` (AES-128)
 - **File 0x01** — at least 16 bytes, containing data encrypted with `data_key` under AES-128-CBC with a zero IV
 
-You can provision cards with tools such as [LibNFC](https://nfc-tools.github.io/projects/libnfc/), [MIFARE DESFire tools](https://github.com/nfc-tools/mifare-desfire), or a dedicated Android app.
-
+You can provision cards with my tool https://github.com/fabian-kapko/desfire-ev3-pywriter
 ---
 
 ## License
