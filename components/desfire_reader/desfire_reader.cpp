@@ -178,6 +178,25 @@ namespace esphome
         return;
       last_card_state_ = true;
 
+      // Parse UID from InListPassiveTarget response:
+      // resp[0]=NbTg, resp[1]=Tg, resp[2..3]=ATQA, resp[4]=SAK,
+      // resp[5]=NFCIDLength, resp[6..]=UID bytes
+      if (resp.size() >= 7) {
+        uint8_t uid_len = resp[5];
+        if (uid_len > 0 && resp.size() >= (size_t)(6 + uid_len)) {
+          std::string uid_str;
+          char buf[3];
+          for (uint8_t i = 0; i < uid_len; i++) {
+            if (i > 0) uid_str += ':';
+            snprintf(buf, sizeof(buf), "%02X", resp[6 + i]);
+            uid_str += buf;
+          }
+          ESP_LOGI(TAG, "UID: %s", uid_str.c_str());
+          if (uid_sensor_)
+            uid_sensor_->publish_state(uid_str);
+        }
+      }
+
       ESP_LOGI(TAG, "New card — starting DESFire workflow");
 
       if (!df_select_app_())
@@ -228,10 +247,10 @@ namespace esphome
         result += (char)decrypted[i];
 
       ESP_LOGI(TAG, "SUCCESS — '%s'", result.c_str());
-      if (auth_sensor_)
-        auth_sensor_->publish_state(true);
       if (result_sensor_)
         result_sensor_->publish_state(result);
+      if (auth_sensor_)
+        auth_sensor_->publish_state(true);
     }
 
     void DesfireReaderComponent::dump_config()
