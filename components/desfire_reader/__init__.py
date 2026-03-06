@@ -3,7 +3,7 @@ import esphome.config_validation as cv
 from esphome.components import i2c, text_sensor, binary_sensor
 from esphome.const import CONF_ID
 
-AUTO_LOAD = ["pn532_i2c", "text_sensor", "binary_sensor"]
+AUTO_LOAD = ["text_sensor", "binary_sensor"]
 
 desfire_ns = cg.esphome_ns.namespace("desfire_reader")
 DesfireReaderComponent = desfire_ns.class_(

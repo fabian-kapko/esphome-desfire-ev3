@@ -9,6 +9,98 @@ namespace esphome
   {
 
     // ═══════════════════════════════════════════════════════════════
+    //  Raw PN532 I2C frame protocol
+    //
+    //  The PN532 prepends a status byte (0x01=ready, 0x00=busy) to
+    //  every I2C read transaction.
+    //
+    //  Normal information frame layout (host → PN532):
+    //    [0x00] PREAMBLE
+    //    [0x00 0xFF] START CODE
+    //    [LEN]  byte count of (TFI + data)
+    //    [LCS]  LEN + LCS == 0x00 mod 256
+    //    [0xD4] TFI (host to PN532)
+    //    [data...] command byte(s)
+    //    [DCS]  TFI + sum(data) + DCS == 0x00 mod 256
+    //    [0x00] POSTAMBLE
+    //
+    //  ACK frame (PN532 → host, 7 bytes with status prepended):
+    //    [0x01] status  [0x00 0x00 0xFF 0x00 0xFF 0x00]
+    // ═══════════════════════════════════════════════════════════════
+
+    bool DesfireReaderComponent::write_command_(const std::vector<uint8_t> &cmd)
+    {
+      uint8_t len = (uint8_t)(cmd.size() + 1); // +1 for TFI
+      uint8_t lcs = (uint8_t)(0x100u - len);
+
+      uint8_t dcs = 0xD4; // TFI counts in checksum
+      for (auto b : cmd)
+        dcs += b;
+      dcs = (uint8_t)(0x100u - dcs);
+
+      std::vector<uint8_t> frame;
+      frame.push_back(0x00); // PREAMBLE
+      frame.push_back(0x00); // START CODE
+      frame.push_back(0xFF);
+      frame.push_back(len);
+      frame.push_back(lcs);
+      frame.push_back(0xD4); // TFI
+      frame.insert(frame.end(), cmd.begin(), cmd.end());
+      frame.push_back(dcs);
+      frame.push_back(0x00); // POSTAMBLE
+
+      if (!this->write_bytes_raw(frame.data(), (uint8_t)frame.size()))
+        return false;
+
+      delay(2);
+
+      // Poll for ACK: each read prepends the status byte, so we read 7 bytes
+      // (1 status + 6 ACK frame bytes).
+      for (int retry = 0; retry < 20; retry++)
+      {
+        uint8_t buf[7] = {};
+        if (this->read_bytes_raw(buf, 7) && buf[0] == 0x01)
+        {
+          return (buf[1] == 0x00 && buf[2] == 0x00 && buf[3] == 0xFF &&
+                  buf[4] == 0x00 && buf[5] == 0xFF && buf[6] == 0x00);
+        }
+        delay(5);
+      }
+      return false;
+    }
+
+    bool DesfireReaderComponent::read_response_(uint8_t command, std::vector<uint8_t> &resp)
+    {
+      // Response layout in buf (status byte always first):
+      //   buf[0]  = 0x01 (ready)
+      //   buf[1]  = 0x00 (PREAMBLE)
+      //   buf[2]  = 0x00  \
+      //   buf[3]  = 0xFF  /  START CODE
+      //   buf[4]  = LEN   (TFI + CMD + payload bytes)
+      //   buf[5]  = LCS
+      //   buf[6]  = 0xD5  (TFI, PN532 → host)
+      //   buf[7]  = command + 1
+      //   buf[8+] = payload  (LEN - 2 bytes)
+      //   ...DCS + POSTAMBLE...
+      for (int retry = 0; retry < 100; retry++)
+      {
+        uint8_t buf[64] = {};
+        if (this->read_bytes_raw(buf, sizeof(buf)) && buf[0] == 0x01)
+        {
+          if (buf[6] != 0xD5 || buf[7] != command + 1)
+            return false;
+          uint8_t data_len = buf[4] - 2; // LEN excludes PREAMBLE/STARTCODE/LCS/DCS/POSTAMBLE
+          resp.clear();
+          for (int i = 0; i < data_len; i++)
+            resp.push_back(buf[8 + i]);
+          return true;
+        }
+        delay(10);
+      }
+      return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //  Setup / Update
     // ═══════════════════════════════════════════════════════════════
 
@@ -18,7 +110,26 @@ namespace esphome
       randomSeed(analogRead(A0) ^ micros());
       aes_key_exp_(app_key_, app_rk_);
       aes_key_exp_(data_key_, data_rk_);
-      pn532_i2c::PN532I2C::setup();
+
+      // Wake the PN532 from any low-power state.
+      static const uint8_t wakeup[] = {
+          0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+      this->write_bytes_raw(wakeup, sizeof(wakeup));
+      delay(10);
+
+      // SAMConfiguration: Normal mode (0x01), timeout=0x14, IRQ disabled (0x00)
+      std::vector<uint8_t> sam_cmd = {0x14, 0x01, 0x14, 0x00};
+      if (!this->write_command_(sam_cmd))
+      {
+        ESP_LOGE(TAG, "PN532 not responding — check I2C wiring (address 0x%02X)",
+                 this->address_);
+        this->mark_failed();
+        return;
+      }
+      std::vector<uint8_t> resp;
+      this->read_response_(0x14, resp); // clear response
+      ESP_LOGCONFIG(TAG, "PN532 initialized.");
     }
 
     void DesfireReaderComponent::update()
@@ -43,7 +154,7 @@ namespace esphome
       }
 
       std::vector<uint8_t> resp;
-      if (!this->read_response(PN532_CMD_IN_LIST_PASSIVE, resp) ||
+      if (!this->read_response_(PN532_CMD_IN_LIST_PASSIVE, resp) ||
           resp.empty() || resp[0] == 0)
       {
         no_card_count_++;
@@ -151,9 +262,9 @@ namespace esphome
       }
 
       std::vector<uint8_t> resp;
-      if (!this->read_response(PN532_CMD_IN_DATA_EXCHANGE, resp))
+      if (!this->read_response_(PN532_CMD_IN_DATA_EXCHANGE, resp))
       {
-        ESP_LOGW(TAG, "desfire_apdu_: read_response failed");
+        ESP_LOGW(TAG, "desfire_apdu_: read_response_ failed");
         return false;
       }
 

@@ -2,7 +2,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
-#include "esphome/components/pn532_i2c/pn532_i2c.h"
+#include "esphome/components/i2c/i2c.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include <vector>
@@ -24,7 +24,7 @@ void aes_key_exp_(const uint8_t *key, uint8_t *rk);
 void aes_enc_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
 void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
 
-class DesfireReaderComponent : public pn532_i2c::PN532I2C {
+class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
  public:
   void setup() override;
   void update() override;
@@ -75,6 +75,15 @@ class DesfireReaderComponent : public pn532_i2c::PN532I2C {
   // State
   bool     last_card_state_{false};
   uint32_t no_card_count_{0};
+
+ private:
+  // Raw PN532 I2C frame protocol.
+  // The PN532 prepends a "ready" status byte (0x01=ready, 0x00=busy) to
+  // every I2C read transaction. write_command_ sends a full PN532 NIF and
+  // waits for the ACK frame. read_response_ polls until the response is
+  // ready and returns the data payload (excluding TFI and response code).
+  bool write_command_(const std::vector<uint8_t> &cmd);
+  bool read_response_(uint8_t command, std::vector<uint8_t> &resp);
 };
 
 }  // namespace desfire_reader
