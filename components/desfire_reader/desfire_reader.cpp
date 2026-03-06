@@ -181,7 +181,7 @@ namespace esphome
       // Parse UID from InListPassiveTarget response:
       // resp[0]=NbTg, resp[1]=Tg, resp[2..3]=ATQA, resp[4]=SAK,
       // resp[5]=NFCIDLength, resp[6..]=UID bytes
-      if (uid_sensor_ && resp.size() >= 7) {
+      if (resp.size() >= 7) {
         uint8_t uid_len = resp[5];
         if (uid_len > 0 && resp.size() >= (size_t)(6 + uid_len)) {
           std::string uid_str;
@@ -192,7 +192,8 @@ namespace esphome
             uid_str += buf;
           }
           ESP_LOGI(TAG, "UID: %s", uid_str.c_str());
-          uid_sensor_->publish_state(uid_str);
+          if (uid_sensor_)
+            uid_sensor_->publish_state(uid_str);
         }
       }
 
@@ -246,10 +247,10 @@ namespace esphome
         result += (char)decrypted[i];
 
       ESP_LOGI(TAG, "SUCCESS — '%s'", result.c_str());
-      if (auth_sensor_)
-        auth_sensor_->publish_state(true);
       if (result_sensor_)
         result_sensor_->publish_state(result);
+      if (auth_sensor_)
+        auth_sensor_->publish_state(true);
     }
 
     void DesfireReaderComponent::dump_config()
