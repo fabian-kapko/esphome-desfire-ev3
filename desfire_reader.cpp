@@ -16,6 +16,8 @@ namespace esphome
     {
       ESP_LOGCONFIG(TAG, "DESFire reader setup...");
       randomSeed(analogRead(A0) ^ micros());
+      aes_key_exp_(app_key_, app_rk_);
+      aes_key_exp_(data_key_, data_rk_);
       pn532_i2c::PN532I2C::setup();
     }
 
@@ -26,7 +28,7 @@ namespace esphome
       if (!this->write_command_(detect_cmd))
       {
         no_card_count_++;
-        if (last_card_state_ && no_card_count_ > 2)
+        if (last_card_state_ && no_card_count_ > 1)
         {
           ESP_LOGD(TAG, "Card removed");
           last_card_state_ = false;
@@ -34,6 +36,8 @@ namespace esphome
             auth_sensor_->publish_state(false);
           if (result_sensor_)
             result_sensor_->publish_state("");
+          if (uid_sensor_)
+            uid_sensor_->publish_state("");
         }
         return;
       }
@@ -43,7 +47,7 @@ namespace esphome
           resp.empty() || resp[0] == 0)
       {
         no_card_count_++;
-        if (last_card_state_ && no_card_count_ > 2)
+        if (last_card_state_ && no_card_count_ > 1)
         {
           ESP_LOGD(TAG, "Card removed");
           last_card_state_ = false;
@@ -51,26 +55,19 @@ namespace esphome
             auth_sensor_->publish_state(false);
           if (result_sensor_)
             result_sensor_->publish_state("");
+          if (uid_sensor_)
+            uid_sensor_->publish_state("");
         }
         return;
       }
 
       no_card_count_ = 0;
-      ESP_LOGD(TAG, "Card detected (NbTg=%d)", resp[0]);
 
       if (last_card_state_)
         return;
       last_card_state_ = true;
-      ESP_LOGI(TAG, "New card — starting DESFire workflow");
 
-      if (!df_select_picc_())
-      {
-        ESP_LOGE(TAG, "SelectPICC FAILED");
-        if (auth_sensor_)
-          auth_sensor_->publish_state(false);
-        return;
-      }
-      ESP_LOGD(TAG, "SelectPICC OK");
+      ESP_LOGI(TAG, "New card — starting DESFire workflow");
 
       if (!df_select_app_())
       {
@@ -80,7 +77,6 @@ namespace esphome
           auth_sensor_->publish_state(false);
         return;
       }
-      ESP_LOGD(TAG, "SelectApp OK");
 
       if (!df_auth_aes_(app_key_))
       {
@@ -89,7 +85,6 @@ namespace esphome
           auth_sensor_->publish_state(false);
         return;
       }
-      ESP_LOGD(TAG, "AES auth OK");
 
       std::vector<uint8_t> raw;
       if (!df_read_file_(0x01, 16, raw))
@@ -99,12 +94,6 @@ namespace esphome
           auth_sensor_->publish_state(false);
         return;
       }
-      ESP_LOGD(TAG, "ReadFile OK (%d bytes)", (int)raw.size());
-
-      char hex[50] = {0};
-      for (int i = 0; i < (int)raw.size() && i < 16; i++)
-        snprintf(hex + i * 3, 4, "%02X ", raw[i]);
-      ESP_LOGD(TAG, "Raw: %s", hex);
 
       if (raw.size() < 16)
       {
@@ -185,7 +174,6 @@ namespace esphome
       for (size_t i = 1; i < resp.size() - 2; i++)
         response.push_back(resp[i]);
 
-      ESP_LOGD(TAG, "APDU SW:%02X%02X payload:%d", sw1, sw2, (int)response.size());
       return true;
     }
 
@@ -230,31 +218,11 @@ namespace esphome
         return false;
       }
 
-      uint8_t rk[44 * 4];
-      aes_key_exp_(key, rk);
-
-      // Log key being used
-      char kbuf[50] = {0};
-      for (int i = 0; i < 16; i++)
-        snprintf(kbuf + i * 3, 4, "%02X ", key[i]);
-      ESP_LOGD(TAG, "AES auth key: %s", kbuf);
-
-      // Log encrypted RndB received from card
-      char rbuf[50] = {0};
-      for (int i = 0; i < 16; i++)
-        snprintf(rbuf + i * 3, 4, "%02X ", resp1[i]);
-      ESP_LOGD(TAG, "RndB_enc    : %s", rbuf);
-
       uint8_t rnd_b[16], iv[16] = {0};
-      aes_dec_block_(rk, resp1.data(), rnd_b);
+      aes_dec_block_(app_rk_, resp1.data(), rnd_b);
       for (int i = 0; i < 16; i++)
         rnd_b[i] ^= iv[i];
 
-      // Log decrypted RndB
-      char dbuf[50] = {0};
-      for (int i = 0; i < 16; i++)
-        snprintf(dbuf + i * 3, 4, "%02X ", rnd_b[i]);
-      ESP_LOGD(TAG, "RndB        : %s", dbuf);
       // Generate RndA, rotate RndB left 1
       uint8_t rnd_a[16];
       random_bytes_(rnd_a, 16);
@@ -267,10 +235,10 @@ namespace esphome
       uint8_t token[32], tmp[16], enc_iv[16] = {0};
       for (int i = 0; i < 16; i++)
         tmp[i] = rnd_a[i] ^ enc_iv[i];
-      aes_enc_block_(rk, tmp, token);
+      aes_enc_block_(app_rk_, tmp, token);
       for (int i = 0; i < 16; i++)
         tmp[i] = rnd_b_rot[i] ^ token[i];
-      aes_enc_block_(rk, tmp, token + 16);
+      aes_enc_block_(app_rk_, tmp, token + 16);
 
       // Send 32-byte token
       std::vector<uint8_t> apdu2 = {0x90, 0xAF, 0x00, 0x00, 0x20};
@@ -473,12 +441,10 @@ namespace esphome
     {
       if (len % 16 != 0)
         return false;
-      uint8_t rk[44 * 4];
-      aes_key_exp_(data_key_, rk);
       uint8_t iv[16] = {0};
       for (size_t b = 0; b < len; b += 16)
       {
-        aes_dec_block_(rk, in + b, out + b);
+        aes_dec_block_(data_rk_, in + b, out + b);
         for (int i = 0; i < 16; i++)
           out[b + i] ^= iv[i];
         memcpy(iv, in + b, 16);

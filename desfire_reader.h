@@ -45,6 +45,7 @@ class DesfireReaderComponent : public pn532_i2c::PN532I2C {
 
   void set_result_sensor(text_sensor::TextSensor *s)    { result_sensor_ = s; }
   void set_auth_sensor(binary_sensor::BinarySensor *s)  { auth_sensor_ = s; }
+  void set_uid_sensor(text_sensor::TextSensor *s)       { uid_sensor_ = s; }
 
  protected:
   bool desfire_apdu_(const std::vector<uint8_t> &apdu,
@@ -61,11 +62,14 @@ class DesfireReaderComponent : public pn532_i2c::PN532I2C {
 
   // Config
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
-  uint8_t app_key_[16]{};   // AES-128 key for app authentication
-  uint8_t data_key_[16]{};  // AES-128 key to decrypt file contents
+  uint8_t app_key_[16]{};    // AES-128 key for app authentication
+  uint8_t data_key_[16]{};   // AES-128 key to decrypt file contents
+  uint8_t app_rk_[176]{};    // precomputed round keys for app_key_
+  uint8_t data_rk_[176]{};   // precomputed round keys for data_key_
 
   // Sensors
   text_sensor::TextSensor     *result_sensor_{nullptr};
+  text_sensor::TextSensor     *uid_sensor_{nullptr};
   binary_sensor::BinarySensor *auth_sensor_{nullptr};
 
   // State

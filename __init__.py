@@ -3,7 +3,6 @@ import esphome.config_validation as cv
 from esphome.components import i2c, text_sensor, binary_sensor
 from esphome.const import CONF_ID
 
-DEPENDENCIES = ["pn532_i2c"]
 AUTO_LOAD = ["pn532_i2c", "text_sensor", "binary_sensor"]
 
 desfire_ns = cg.esphome_ns.namespace("desfire_reader")
@@ -18,6 +17,7 @@ CONF_APP_KEY  = "app_key"   # AES-128 key for app authentication
 CONF_DATA_KEY = "data_key"  # AES-128 key to decrypt file contents
 CONF_RESULT   = "result"
 CONF_AUTH_OK  = "auth_ok"
+CONF_UID      = "uid"
 
 
 def validate_hex_bytes(expected_len, label):
@@ -40,9 +40,10 @@ CONFIG_SCHEMA = (
         cv.Required(CONF_DATA_KEY): validate_hex_bytes(16, "data_key"),
         cv.Optional(CONF_RESULT):   text_sensor.text_sensor_schema(),
         cv.Optional(CONF_AUTH_OK):  binary_sensor.binary_sensor_schema(),
+        cv.Optional(CONF_UID):      text_sensor.text_sensor_schema(),
     })
     .extend(i2c.i2c_device_schema(0x24))
-    .extend(cv.polling_component_schema("1000ms"))
+    .extend(cv.polling_component_schema("500ms"))
 )
 
 
@@ -64,3 +65,7 @@ async def to_code(config):
     if CONF_AUTH_OK in config:
         sens = await binary_sensor.new_binary_sensor(config[CONF_AUTH_OK])
         cg.add(var.set_auth_sensor(sens))
+
+    if CONF_UID in config:
+        sens = await text_sensor.new_text_sensor(config[CONF_UID])
+        cg.add(var.set_uid_sensor(sens))
