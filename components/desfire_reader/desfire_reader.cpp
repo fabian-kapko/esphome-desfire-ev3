@@ -36,17 +36,16 @@ bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len)
   if (this->write(frame, total) != i2c::ERROR_OK)
     return false;
 
-  delay(1);
+  delay(2);
 
   // Poll for ACK: 1 status + 6 ACK frame bytes.
-  // PN532 ACK comes fast — 15 × 2 ms = 30 ms ceiling.
   for (uint8_t retry = 0; retry < 15; retry++) {
     uint8_t ack[7];
     if (this->read(ack, 7) == i2c::ERROR_OK && ack[0] == 0x01) {
       return (ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
               ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00);
     }
-    delay(2);
+    delay(3);
   }
   return false;
 }
@@ -60,6 +59,10 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
 
   for (uint8_t poll = 0; poll < max_polls; poll++) {
     if (this->read(buf, sizeof(buf)) != i2c::ERROR_OK || buf[0] != 0x01) {
+      // 3 ms is enough at 400 kHz I2C — a 64-byte read takes ~1.3 ms,
+      // so this gives the PN532 a brief processing window without
+      // wasting time.  The yield() calls between DESFire steps handle
+      // WiFi stack breathing.
       delay(3);
       continue;
     }
@@ -194,7 +197,12 @@ void DesfireReaderComponent::setup() {
   if (this->write_command_(rf_cfg, sizeof(rf_cfg))) {
     uint8_t rf_resp[4];
     uint8_t rf_len;
-    this->read_response_(0x12, rf_resp, sizeof(rf_resp), rf_len, 30);
+    if (this->read_response_(0x12, rf_resp, sizeof(rf_resp), rf_len, 30))
+      ESP_LOGCONFIG(TAG, "PN532 MaxRetries configured OK.");
+    else
+      ESP_LOGW(TAG, "PN532 RFConfiguration response failed — using defaults.");
+  } else {
+    ESP_LOGW(TAG, "PN532 RFConfiguration write failed — using defaults.");
   }
 
   ESP_LOGCONFIG(TAG, "PN532 initialized (MaxRetries=2).");
@@ -263,6 +271,7 @@ void DesfireReaderComponent::update() {
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
+      yield();  // let WiFi/mDNS run
 
       if (!df_auth_aes_()) {
         ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
@@ -270,6 +279,7 @@ void DesfireReaderComponent::update() {
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
+      yield();  // let WiFi/mDNS run
 
       uint8_t raw[32];
       uint8_t raw_len;
