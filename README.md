@@ -47,6 +47,7 @@ i2c:
   sda: GPIO4
   scl: GPIO5
   scan: true
+  frequency: 100kHz
 
 external_components:
   - source:
@@ -57,11 +58,15 @@ external_components:
 desfire_reader:
   id: my_reader
   address: 0x24
-  update_interval: 500ms
+  update_interval: 100ms
 
   app_id: "A1:B2:C3"
   app_key: "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
   data_key: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+
+  uid:
+    name: "Card UID"
+    id: card_uid
 
   result:
     name: "Card Result"
@@ -70,18 +75,11 @@ desfire_reader:
   auth_ok:
     name: "Card Auth OK"
     id: card_auth
-    on_state:
+    on_press:
       then:
-        - if:
-            condition:
-              binary_sensor.is_on: card_auth
-            then:
-              - logger.log:
-                  format: "Valid card: %s"
-                  args: ["id(card_data).state.c_str()"]
-
-  uid:
-    name: "Card UID"
+        - logger.log:
+            format: "Valid card: %s"
+            args: ["id(card_data).state.c_str()"] 
 ```
 
 ### Configuration variables
