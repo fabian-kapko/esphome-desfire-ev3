@@ -100,10 +100,11 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   char     last_result_[18]{};
   bool     last_auth_{false};
 
-  // ── Cooldown + UID dedup (replaces card-removed scanning) ──
+  // ── Cooldown + UID dedup ──
   uint32_t cooldown_until_{0};
   uint8_t  prev_uid_[7]{};
   uint8_t  prev_uid_len_{0};
+  bool     card_present_{false};  // true while card data is published
 };
 
 }  // namespace desfire_reader
