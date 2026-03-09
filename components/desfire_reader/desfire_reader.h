@@ -59,6 +59,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
 
  protected:
   // ── PN532 I2C frame layer ──
+  bool read_ready_status_();
   bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
   // max_polls × 3 ms = worst-case blocking time for this call.
   // Use ~20 for detect (~60 ms), ~80 for DESFire APDU (~240 ms).

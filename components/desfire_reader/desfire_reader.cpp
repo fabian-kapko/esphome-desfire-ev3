@@ -10,6 +10,11 @@ namespace desfire_reader {
 //  Raw PN532 I2C frame protocol
 // ═══════════════════════════════════════════════════════════════
 
+bool DesfireReaderComponent::read_ready_status_() {
+  uint8_t status = 0x00;
+  return this->read(&status, 1) == i2c::ERROR_OK && status == 0x01;
+}
+
 bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len) {
   uint8_t frame[PN532_BUF_SIZE];
   uint8_t len = cmd_len + 1;  // +1 for TFI
@@ -38,12 +43,17 @@ bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len)
 
   delay(2);
 
-  // Poll for ACK: 1 status + 6 ACK frame bytes.
+  // Poll for ACK using a 1-byte ready check first.
   for (uint8_t retry = 0; retry < 15; retry++) {
-    uint8_t ack[7];
-    if (this->read(ack, 7) == i2c::ERROR_OK && ack[0] == 0x01) {
-      return (ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
-              ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00);
+    if (!this->read_ready_status_()) {
+      delay(3);
+      continue;
+    }
+
+    uint8_t ack[6];
+    if (this->read(ack, sizeof(ack)) == i2c::ERROR_OK) {
+      return (ack[0] == 0x00 && ack[1] == 0x00 && ack[2] == 0xFF &&
+              ack[3] == 0x00 && ack[4] == 0xFF && ack[5] == 0x00);
     }
     delay(3);
   }
@@ -55,54 +65,63 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
                                             uint8_t &resp_len,
                                             uint8_t max_polls) {
   resp_len = 0;
-  uint8_t buf[PN532_BUF_SIZE];
 
   for (uint8_t poll = 0; poll < max_polls; poll++) {
-    if (this->read(buf, sizeof(buf)) != i2c::ERROR_OK || buf[0] != 0x01) {
-      // 3 ms is enough at 400 kHz I2C — a 64-byte read takes ~1.3 ms,
-      // so this gives the PN532 a brief processing window without
-      // wasting time.  The yield() calls between DESFire steps handle
-      // WiFi stack breathing.
+    if (!this->read_ready_status_()) {
+      delay(3);
+      continue;
+    }
+
+    uint8_t header[6];
+    if (this->read(header, sizeof(header)) != i2c::ERROR_OK) {
       delay(3);
       continue;
     }
 
     // Validate preamble + start code
-    if (buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0xFF)
+    if (header[0] != 0x00 || header[1] != 0x00 || header[2] != 0xFF)
       return false;
 
     // Validate LEN / LCS
-    uint8_t frame_len = buf[4];
-    if ((uint8_t)(frame_len + buf[5]) != 0)
+    uint8_t frame_len = header[3];
+    if ((uint8_t)(frame_len + header[4]) != 0)
       return false;
-
-    // Validate TFI + echoed command
-    if (buf[6] != 0xD5 || buf[7] != (uint8_t)(command + 1))
-      return false;
-
     if (frame_len < 2)
       return false;
-    uint8_t payload_len = frame_len - 2;
 
-    // Bounds: payload + DCS + postamble must fit in buf
-    if ((uint16_t)(10 + payload_len) > sizeof(buf))
+    // TFI + command + payload + DCS + postamble
+    uint8_t tail_len = frame_len + 2;
+    if ((uint16_t) tail_len > (uint16_t) PN532_BUF_SIZE)
       return false;
 
-    // Validate DCS
+    uint8_t tail[PN532_BUF_SIZE];
+    if (this->read(tail, tail_len) != i2c::ERROR_OK) {
+      delay(3);
+      continue;
+    }
+
+    // Validate TFI + echoed command
+    if (tail[0] != 0xD5 || tail[1] != (uint8_t) (command + 1))
+      return false;
+
+    uint8_t payload_len = frame_len - 2;
+
+    // Validate DCS (TFI + PD0..PDn + DCS == 0)
     uint8_t dcs_sum = 0;
     for (uint8_t i = 0; i < frame_len; i++)
-      dcs_sum += buf[6 + i];
-    dcs_sum += buf[6 + frame_len];
+      dcs_sum += tail[i];
+    dcs_sum += tail[frame_len];
     if (dcs_sum != 0)
       return false;
 
     // Validate postamble
-    if (buf[7 + frame_len] != 0x00)
+    if (tail[frame_len + 1] != 0x00)
       return false;
 
-    // Copy payload
+    // Copy payload (skip TFI + response code)
     uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
-    memcpy(resp, buf + 8, copy_len);
+    if (copy_len > 0)
+      memcpy(resp, tail + 2, copy_len);
     resp_len = copy_len;
     return true;
   }
@@ -165,6 +184,12 @@ void DesfireReaderComponent::publish_result_(const char *str) {
 
 void DesfireReaderComponent::setup() {
   ESP_LOGCONFIG(TAG, "DESFire reader setup...");
+  if (this->get_update_interval() < 250) {
+    ESP_LOGW(TAG,
+             "Update interval %u ms is aggressive for ESP8266 + PN532 over I2C; "
+             "250-500 ms is recommended to keep WiFi responsive.",
+             this->get_update_interval());
+  }
   randomSeed(analogRead(A0) ^ micros());
   aes_key_exp_(app_key_, app_rk_);
   aes_key_exp_(data_key_, data_rk_);
@@ -213,6 +238,8 @@ void DesfireReaderComponent::setup() {
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
+  yield();
+
   // ── Cooldown gate: skip immediately if still in cooldown ──
   uint32_t now = millis();
   if ((int32_t)(cooldown_until_ - now) > 0)
@@ -322,6 +349,7 @@ void DesfireReaderComponent::update() {
   }
 
   // ── No card detected — debounce before clearing sensors ──
+  yield();
   if (!detected) {
     if (no_card_count_ < 255) no_card_count_++;
     // Require 3 consecutive misses before declaring card gone.
