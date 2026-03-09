@@ -629,4 +629,4 @@ void DesfireReaderComponent::random_bytes_(uint8_t *buf, size_t len) {
 }
 
 }  // namespace desfire_reader
-}  // namespace esphome
+}  // namespace esphome/
