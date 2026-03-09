@@ -261,6 +261,7 @@ void DesfireReaderComponent::update() {
         ESP_LOGI(TAG, "UID: %s", uid_str);
         publish_uid_(uid_str);
       }
+      card_present_ = true;
 
       ESP_LOGI(TAG, "New card — starting DESFire workflow");
 
@@ -315,7 +316,6 @@ void DesfireReaderComponent::update() {
       ESP_LOGI(TAG, "SUCCESS — '%s'", result);
       publish_auth_(true);
       publish_result_(result);
-      card_present_ = true;
       cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
       return;
     }
