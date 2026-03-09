@@ -105,6 +105,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t  prev_uid_[7]{};
   uint8_t  prev_uid_len_{0};
   bool     card_present_{false};  // true while card data is published
+  uint8_t  no_card_count_{0};    // consecutive no-card detects (debounce)
 };
 
 }  // namespace desfire_reader

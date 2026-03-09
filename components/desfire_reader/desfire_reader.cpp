@@ -212,119 +212,119 @@ void DesfireReaderComponent::update() {
 
   // ── Detect card (short timeout — PN532 MaxRetries is low) ──
   const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
-  if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
-    if (card_present_) {
+  bool detected = false;
+
+  if (this->write_command_(detect_cmd, sizeof(detect_cmd))) {
+    uint8_t resp[48];
+    uint8_t resp_len;
+    // 20 polls × 3 ms = 60 ms max wait
+    if (this->read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp),
+                             resp_len, 20) &&
+        resp_len > 0 && resp[0] != 0) {
+      detected = true;
+      no_card_count_ = 0;
+
+      // ── Parse UID ──
+      uint8_t uid_len = 0;
+      const uint8_t *uid_ptr = nullptr;
+      if (resp_len >= 7) {
+        uid_len = resp[5];
+        if (uid_len > 7) uid_len = 7;
+        if (resp_len >= (uint8_t)(6 + uid_len))
+          uid_ptr = resp + 6;
+        else
+          uid_len = 0;
+      }
+
+      // ── Same card still on reader? Skip workflow, extend cooldown. ──
+      if (uid_len > 0 && uid_len == prev_uid_len_ &&
+          memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
+        cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
+        return;
+      }
+
+      // ── New card: cache UID, publish, run DESFire workflow ──
+      if (uid_len > 0 && uid_ptr != nullptr) {
+        memcpy(prev_uid_, uid_ptr, uid_len);
+        prev_uid_len_ = uid_len;
+
+        char uid_str[24];
+        format_uid_(uid_ptr, uid_len, uid_str);
+        ESP_LOGI(TAG, "UID: %s", uid_str);
+        publish_uid_(uid_str);
+      }
+
+      ESP_LOGI(TAG, "New card — starting DESFire workflow");
+
+      if (!df_select_app_()) {
+        ESP_LOGE(TAG, "SelectApp FAILED — app %02X%02X%02X not on card?",
+                 app_id_[0], app_id_[1], app_id_[2]);
+        publish_auth_(false);
+        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        return;
+      }
+
+      if (!df_auth_aes_()) {
+        ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
+        publish_auth_(false);
+        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        return;
+      }
+
+      uint8_t raw[32];
+      uint8_t raw_len;
+      if (!df_read_file_(0x01, 16, raw, raw_len)) {
+        ESP_LOGE(TAG, "ReadFile FAILED");
+        publish_auth_(false);
+        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        return;
+      }
+
+      if (raw_len < 16) {
+        ESP_LOGE(TAG, "Data too short (%d)", raw_len);
+        publish_auth_(false);
+        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        return;
+      }
+
+      uint8_t decrypted[16];
+      if (!aes_cbc_decrypt_(raw, 16, decrypted)) {
+        ESP_LOGE(TAG, "AES decrypt FAILED");
+        publish_auth_(false);
+        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        return;
+      }
+
+      // Extract printable ASCII
+      char result[17];
+      uint8_t rlen = 0;
+      for (uint8_t i = 0; i < 16 && decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
+        result[rlen++] = (char)decrypted[i];
+      result[rlen] = '\0';
+
+      ESP_LOGI(TAG, "SUCCESS — '%s'", result);
+      publish_auth_(true);
+      publish_result_(result);
+      card_present_ = true;
+      cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
+      return;
+    }
+  }
+
+  // ── No card detected — debounce before clearing sensors ──
+  if (!detected) {
+    if (no_card_count_ < 255) no_card_count_++;
+    // Require 3 consecutive misses before declaring card gone.
+    // At ~60 ms per detect attempt, this is ~180 ms debounce.
+    if (no_card_count_ >= 3 && card_present_) {
       card_present_ = false;
       prev_uid_len_ = 0;
       publish_auth_(false);
       publish_result_("");
       publish_uid_("");
-    }
-    return;
-  }
-
-  uint8_t resp[48];
-  uint8_t resp_len;
-  // 20 polls × 3 ms = 60 ms max wait — fast return if field is empty
-  if (!this->read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp),
-                            resp_len, 20) ||
-      resp_len == 0 || resp[0] == 0) {
-    // No card — clear sensors if they were showing card data
-    if (card_present_) {
-      card_present_ = false;
-      publish_auth_(false);
-      publish_result_("");
-      publish_uid_("");
-    }
-    prev_uid_len_ = 0;
-    return;
-  }
-
-  // ── Parse UID ──
-  uint8_t uid_len = 0;
-  const uint8_t *uid_ptr = nullptr;
-  if (resp_len >= 7) {
-    uid_len = resp[5];
-    if (uid_len > 7) uid_len = 7;  // cap at max NFC UID length
-    if (resp_len >= (uint8_t)(6 + uid_len)) {
-      uid_ptr = resp + 6;
-    } else {
-      uid_len = 0;
+      ESP_LOGD(TAG, "Card removed");
     }
   }
-
-  // ── Same card still on reader? Skip workflow, apply cooldown. ──
-  if (uid_len > 0 && uid_len == prev_uid_len_ &&
-      memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
-    // Card hasn't changed — don't re-auth, just sleep.
-    cooldown_until_ = now + COOLDOWN_SUCCESS_MS;
-    return;
-  }
-
-  // ── New card: cache UID, publish, run DESFire workflow ──
-  if (uid_len > 0 && uid_ptr != nullptr) {
-    memcpy(prev_uid_, uid_ptr, uid_len);
-    prev_uid_len_ = uid_len;
-
-    char uid_str[24];
-    format_uid_(uid_ptr, uid_len, uid_str);
-    ESP_LOGI(TAG, "UID: %s", uid_str);
-    publish_uid_(uid_str);
-  }
-
-  ESP_LOGI(TAG, "New card — starting DESFire workflow");
-
-  if (!df_select_app_()) {
-    ESP_LOGE(TAG, "SelectApp FAILED — app %02X%02X%02X not on card?",
-             app_id_[0], app_id_[1], app_id_[2]);
-    publish_auth_(false);
-    cooldown_until_ = now + COOLDOWN_FAIL_MS;
-    return;
-  }
-
-  if (!df_auth_aes_()) {
-    ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
-    publish_auth_(false);
-    cooldown_until_ = now + COOLDOWN_FAIL_MS;
-    return;
-  }
-
-  uint8_t raw[32];
-  uint8_t raw_len;
-  if (!df_read_file_(0x01, 16, raw, raw_len)) {
-    ESP_LOGE(TAG, "ReadFile FAILED");
-    publish_auth_(false);
-    cooldown_until_ = now + COOLDOWN_FAIL_MS;
-    return;
-  }
-
-  if (raw_len < 16) {
-    ESP_LOGE(TAG, "Data too short (%d)", raw_len);
-    publish_auth_(false);
-    cooldown_until_ = now + COOLDOWN_FAIL_MS;
-    return;
-  }
-
-  uint8_t decrypted[16];
-  if (!aes_cbc_decrypt_(raw, 16, decrypted)) {
-    ESP_LOGE(TAG, "AES decrypt FAILED");
-    publish_auth_(false);
-    cooldown_until_ = now + COOLDOWN_FAIL_MS;
-    return;
-  }
-
-  // Extract printable ASCII
-  char result[17];
-  uint8_t rlen = 0;
-  for (uint8_t i = 0; i < 16 && decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
-    result[rlen++] = (char)decrypted[i];
-  result[rlen] = '\0';
-
-  ESP_LOGI(TAG, "SUCCESS — '%s'", result);
-  publish_auth_(true);
-  publish_result_(result);
-  card_present_ = true;
-  cooldown_until_ = now + COOLDOWN_SUCCESS_MS;
 }
 
 void DesfireReaderComponent::dump_config() {
