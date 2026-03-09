@@ -5,8 +5,7 @@
 #include "esphome/components/i2c/i2c.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
-#include <vector>
-#include <string>
+#include <string.h>
 
 namespace esphome {
 namespace desfire_reader {
@@ -18,6 +17,12 @@ static const uint8_t DESFIRE_OK          = 0x00;
 static const uint8_t DESFIRE_MORE_FRAMES = 0xAF;
 static const uint8_t PN532_CMD_IN_DATA_EXCHANGE = 0x40;
 static const uint8_t PN532_CMD_IN_LIST_PASSIVE  = 0x4A;
+
+static const uint8_t PN532_BUF_SIZE = 64;
+
+// Cooldowns (ms)
+static const uint16_t COOLDOWN_SUCCESS_MS = 500;
+static const uint16_t COOLDOWN_FAIL_MS    = 200;
 
 // Forward declarations of standalone AES helpers (defined in .cpp)
 void aes_key_exp_(const uint8_t *key, uint8_t *rk);
@@ -33,13 +38,18 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_app_id(uint8_t a, uint8_t b, uint8_t c) {
     app_id_[0] = a; app_id_[1] = b; app_id_[2] = c;
   }
+  void set_app_key(const uint8_t *key) { memcpy(app_key_, key, 16); }
+  void set_data_key(const uint8_t *key) { memcpy(data_key_, key, 16); }
+
+  // Overloads for vector (Python codegen sends std::vector)
   void set_app_key(const std::vector<uint8_t> &key) {
     for (int i = 0; i < 16; i++) app_key_[i] = key[i];
   }
   void set_data_key(const std::vector<uint8_t> &key) {
     for (int i = 0; i < 16; i++) data_key_[i] = key[i];
   }
-  // Legacy no-op stubs (backward compat)
+
+  // Legacy no-op stubs
   void set_aes_key(const std::vector<uint8_t> &key) { set_data_key(key); }
   void set_des_key(const std::vector<uint8_t> &) {}
 
@@ -48,42 +58,54 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_uid_sensor(text_sensor::TextSensor *s)       { uid_sensor_ = s; }
 
  protected:
-  bool desfire_apdu_(const std::vector<uint8_t> &apdu,
-                     std::vector<uint8_t> &response,
-                     uint8_t &sw1, uint8_t &sw2);
+  // ── PN532 I2C frame layer ──
+  bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
+  // max_polls × 3 ms = worst-case blocking time for this call.
+  // Use ~20 for detect (~60 ms), ~80 for DESFire APDU (~240 ms).
+  bool read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
+                      uint8_t &resp_len, uint8_t max_polls = 80);
 
-  bool df_select_picc_();
+  // ── DESFire operations (all fixed-size stack buffers) ──
+  bool desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len,
+                     uint8_t *response, uint8_t resp_cap,
+                     uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
   bool df_select_app_();
-  bool df_auth_aes_(const uint8_t *key);
-  bool df_read_file_(uint8_t file_id, size_t length, std::vector<uint8_t> &out);
+  bool df_auth_aes_();
+  bool df_read_file_(uint8_t file_id, uint8_t length,
+                     uint8_t *out, uint8_t &out_len);
 
-  bool aes_cbc_decrypt_(const uint8_t *in, size_t len, uint8_t *out);
-  void random_bytes_(uint8_t *buf, size_t len);
+  bool aes_cbc_decrypt_(const uint8_t *in, uint8_t len, uint8_t *out);
+  void random_bytes_(uint8_t *buf, uint8_t len);
 
-  // Config
+  // ── Publish helpers (only when value changes) ──
+  void format_uid_(const uint8_t *uid_bytes, uint8_t uid_len, char *out);
+  void publish_uid_(const char *uid_str);
+  void publish_auth_(bool state);
+  void publish_result_(const char *str);
+
+  // ── Config ──
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
-  uint8_t app_key_[16]{};    // AES-128 key for app authentication
-  uint8_t data_key_[16]{};   // AES-128 key to decrypt file contents
-  uint8_t app_rk_[176]{};    // precomputed round keys for app_key_
-  uint8_t data_rk_[176]{};   // precomputed round keys for data_key_
+  uint8_t app_key_[16]{};
+  uint8_t data_key_[16]{};
+  uint8_t app_rk_[176]{};
+  uint8_t data_rk_[176]{};
 
-  // Sensors
+  // ── Sensors ──
   text_sensor::TextSensor     *result_sensor_{nullptr};
   text_sensor::TextSensor     *uid_sensor_{nullptr};
   binary_sensor::BinarySensor *auth_sensor_{nullptr};
 
-  // State
-  bool     last_card_state_{false};
-  uint32_t no_card_count_{0};
+  // ── Publish-only-when-changed cache ──
+  char     last_uid_[24]{};
+  char     last_result_[18]{};
+  bool     last_auth_{false};
 
- private:
-  // Raw PN532 I2C frame protocol.
-  // The PN532 prepends a "ready" status byte (0x01=ready, 0x00=busy) to
-  // every I2C read transaction. write_command_ sends a full PN532 NIF and
-  // waits for the ACK frame. read_response_ polls until the response is
-  // ready and returns the data payload (excluding TFI and response code).
-  bool write_command_(const std::vector<uint8_t> &cmd);
-  bool read_response_(uint8_t command, std::vector<uint8_t> &resp);
+  // ── Cooldown + UID dedup ──
+  uint32_t cooldown_until_{0};
+  uint8_t  prev_uid_[7]{};
+  uint8_t  prev_uid_len_{0};
+  bool     card_present_{false};  // true while card data is published
+  uint8_t  no_card_count_{0};    // consecutive no-card detects (debounce)
 };
 
 }  // namespace desfire_reader
