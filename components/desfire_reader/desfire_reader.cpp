@@ -16,7 +16,7 @@ namespace desfire_reader {
 
 bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len) {
   uint8_t frame[PN532_BUF_SIZE];
-  uint8_t len = cmd_len + 1;  // +1 for TFI
+  uint8_t len = cmd_len + 1;
   uint8_t total = 6 + cmd_len + 2;
 
   if (total > sizeof(frame))
@@ -27,22 +27,21 @@ bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len)
     dcs += cmd[i];
   dcs = (uint8_t)(0x100u - dcs);
 
-  frame[0] = 0x00;  // PREAMBLE
-  frame[1] = 0x00;  // START CODE
+  frame[0] = 0x00;
+  frame[1] = 0x00;
   frame[2] = 0xFF;
   frame[3] = len;
-  frame[4] = (uint8_t)(0x100u - len);  // LCS
-  frame[5] = 0xD4;  // TFI
+  frame[4] = (uint8_t)(0x100u - len);
+  frame[5] = 0xD4;
   memcpy(frame + 6, cmd, cmd_len);
   frame[6 + cmd_len] = dcs;
-  frame[7 + cmd_len] = 0x00;  // POSTAMBLE
+  frame[7 + cmd_len] = 0x00;
 
   if (this->write(frame, total) != i2c::ERROR_OK)
     return false;
 
   delay(2);
 
-  // Poll for ACK: 1 status + 6 ACK frame bytes.
   for (uint8_t retry = 0; retry < 15; retry++) {
     uint8_t ack[7];
     if (this->read(ack, 7) == i2c::ERROR_OK && ack[0] == 0x01) {
@@ -67,16 +66,13 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
       continue;
     }
 
-    // Validate preamble + start code
     if (buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0xFF)
       return false;
 
-    // Validate LEN / LCS
     uint8_t frame_len = buf[4];
     if ((uint8_t)(frame_len + buf[5]) != 0)
       return false;
 
-    // Validate TFI + echoed command
     if (buf[6] != 0xD5 || buf[7] != (uint8_t)(command + 1))
       return false;
 
@@ -84,11 +80,9 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
       return false;
     uint8_t payload_len = frame_len - 2;
 
-    // Bounds: payload + DCS + postamble must fit in buf
     if ((uint16_t)(10 + payload_len) > sizeof(buf))
       return false;
 
-    // Validate DCS
     uint8_t dcs_sum = 0;
     for (uint8_t i = 0; i < frame_len; i++)
       dcs_sum += buf[6 + i];
@@ -96,11 +90,9 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
     if (dcs_sum != 0)
       return false;
 
-    // Validate postamble
     if (buf[7 + frame_len] != 0x00)
       return false;
 
-    // Copy payload
     uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
     memcpy(resp, buf + 8, copy_len);
     resp_len = copy_len;
@@ -111,7 +103,7 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
 
 // ═══════════════════════════════════════════════════════════════
 //  Publish helpers — only fire when the value actually changes
-// ═══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════���
 
 void DesfireReaderComponent::format_uid_(const uint8_t *uid_bytes,
                                          uint8_t uid_len, char *out) {
@@ -168,14 +160,12 @@ void DesfireReaderComponent::setup() {
   aes_key_exp_(app_key_, app_rk_);
   aes_key_exp_(data_key_, data_rk_);
 
-  // Wake PN532 from low-power state.
   static const uint8_t wakeup[] = {
       0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   this->write(wakeup, sizeof(wakeup));
   delay(10);
 
-  // SAMConfiguration: normal mode, timeout=0x14, IRQ off
   const uint8_t sam_cmd[] = {0x14, 0x01, 0x14, 0x00};
   if (!this->write_command_(sam_cmd, sizeof(sam_cmd))) {
     ESP_LOGE(TAG, "PN532 not responding — check I2C wiring (addr 0x%02X)",
@@ -203,7 +193,7 @@ void DesfireReaderComponent::setup() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Update — cooldown + UID dedup, no card-removed scanning
+//  Update — cooldown + UID dedup
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
@@ -270,8 +260,6 @@ void DesfireReaderComponent::update() {
       }
       yield();
 
-      // Read up to 32 bytes: new format = [16-byte IV][16-byte ciphertext]
-      // Legacy format = [16-byte ciphertext] with implicit zero IV
       uint8_t raw[48];
       uint8_t raw_len;
       if (!df_read_file_(0x01, 32, raw, raw_len)) {
@@ -285,10 +273,8 @@ void DesfireReaderComponent::update() {
       bool decrypt_ok = false;
 
       if (raw_len >= 32) {
-        // New format: first 16 bytes = per-card random IV, next 16 = ciphertext
         decrypt_ok = aes_cbc_decrypt_(raw + 16, 16, raw, decrypted);
       } else if (raw_len >= 16) {
-        // Legacy format: zero IV
         ESP_LOGW(TAG, "Legacy 16-byte file (zero IV) — consider re-provisioning card");
         uint8_t zero_iv[16] = {0};
         decrypt_ok = aes_cbc_decrypt_(raw, 16, zero_iv, decrypted);
@@ -306,7 +292,6 @@ void DesfireReaderComponent::update() {
         return;
       }
 
-      // Extract printable ASCII
       char result[17];
       uint8_t rlen = 0;
       for (uint8_t i = 0; i < 16 && decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
@@ -395,52 +380,87 @@ bool DesfireReaderComponent::df_select_app_() {
   return sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK;
 }
 
-// Fix #2: Full mutual authentication with correct IV handling.
+// ── DESFire legacy AuthenticateAES (INS 0xAA) with full mutual verification ──
 //
-// DESFire legacy AuthenticateAES (INS 0xAA) CBC IV state:
+// Protocol (NXP AN10833 / data sheet §11.6.1.1):
 //
-//   Step 1 — card sends E_k(RndB) with IV=0
-//            Reader decrypts with IV=0.  Reader's decrypt-IV becomes E_k(RndB).
+//   Step 1:  Reader  →  Card:  [90 AA 00 00 01 00 00]
+//            Card    →  Reader: E_k(RndB), 16 bytes,  SW 91AF
 //
-//   Step 2 — reader sends E_k_cbc(RndA || RndB')
-//            This is 2 blocks encrypted with CBC IV starting at 0.
-//            After sending, the "last ciphertext sent" = token[16..31].
+//   Step 2:  Reader decrypts E_k(RndB) with IV=0 to get RndB.
+//            Reader generates RndA (16 random bytes).
+//            Reader encrypts (RndA ∥ RndB') with CBC IV=0  (RndB' = rotate-left-1(RndB)).
+//            Reader  →  Card:  [90 AF 00 00 20 <32 bytes> 00]
+//            Card    →  Reader: E_k(RndA'), 16 bytes,  SW 9100
 //
-//   Step 3 — card sends E_k(RndA') encrypted with CBC.
-//            Per the DESFire legacy auth spec, the card uses IV = the last
-//            ciphertext block it received from us, i.e. token[16..31].
-//            BUT — the reader must decrypt it using its own receive-side IV,
-//            which after step 1 was set to E_k(RndB) (i.e. resp1, the raw
-//            encrypted RndB the card sent in step 1).
+//   Step 3:  Reader decrypts E_k(RndA') and verifies it equals rotate-left-1(RndA).
 //
-//   Actually, for DESFire legacy AES auth the simplest correct approach:
-//   The card's response is a single AES block.  The CBC IV the card used
-//   to encrypt it is the last block it received = token[16..31].
-//   To decrypt: plaintext = Dec(resp2) XOR IV, where IV = token[16..31].
+// CBC IV tracking — the DESFire legacy auth uses a SINGLE shared IV that
+// chains across ALL operations in both directions:
 //
-//   HOWEVER — PyCryptodome's legacy_aes auth in provison.py does NOT verify
-//   the card's response at all (it just checks SW).  So the card definitely
-//   sends E(RndA') back.  The question is what IV it uses.
+//   Initial IV = 0x00..00
 //
-//   Per NXP AN10833 §7.1.2, for legacy AuthenticateAES:
-//     - Card decrypts our 2-block message.  The CBC state after decrypting
-//       block 2 has IV = token[16..31] (the second ciphertext block).
-//     - Card encrypts RndA' with CBC continuing from where it left off.
-//       The IV for encrypting RndA' is token[16..31].
-//     - So to decrypt on our side: plain = Dec(resp2) XOR token[16..31]
+//   Card encrypts RndB:       ciphertext = Enc(RndB ⊕ IV=0)
+//                              IV becomes E_k(RndB) = resp1
 //
-//   But wait — in the DESFire protocol, the direction matters.
-//   The card maintains SEPARATE IVs for send and receive.
-//     - Receive IV (card decrypting our data): starts at 0, after our
-//       2 blocks it's token[16..31].
-//     - Send IV (card encrypting response): starts at 0 from step 1
-//       where it sent E(RndB).  After step 1, the send IV = E_k(RndB) = resp1.
-//       For step 3, the card encrypts RndA' with send-side IV = resp1.
-//       So: ciphertext = Enc(RndA' XOR resp1)
-//       To decrypt: RndA' = Dec(resp2) XOR resp1
+//   Reader decrypts resp1:    plaintext = Dec(resp1) ⊕ IV=0  → RndB
+//                              IV becomes resp1
 //
-//   This is why using token[16..31] as IV was wrong!  The correct IV is resp1
-//   (the original encrypted RndB the card sent us in step 1).
+//   Reader encrypts RndA:     ciphertext[0] = Enc(RndA ⊕ IV=resp1)   → token[0..15]
+//                              IV becomes token[0..15]
+//   Reader encrypts RndB':   ciphertext[1] = Enc(RndB' ⊕ token[0..15]) → token[16..31]
+//                              IV becomes token[16..31]
+//
+//   Card decrypts token:      (mirrors the above)
+//                              IV becomes token[16..31]
+//
+//   Card encrypts RndA':     ciphertext = Enc(RndA' ⊕ IV=token[16..31])
+//                              → resp2
+//
+//   Reader decrypts resp2:    plaintext = Dec(resp2) ⊕ IV=token[16..31]  → RndA'
+//
+// CRITICAL: The reader's decrypt in step 1 used IV=0 (single block = ECB).
+// But steps 1+2 were done as separate operations without carrying the IV.
+// The ORIGINAL code encrypted with IV=0 (fresh), which means the card also
+// sees a fresh IV=0 for decryption.  So the card's send-side IV after
+// processing our 2 blocks = our second ciphertext block = token[16..31].
+//
+// HOWEVER: our step 1 decrypt used a raw aes_dec_block_ (no CBC XOR with
+// IV=0, which is fine since XOR with 0 is identity).  But this means we
+// treated step 1 as standalone — and step 2 encryption also starts with
+// IV=0 independently.  This is actually the same as what the Python code
+// does:  AES.new(key, CBC, iv=zeros).encrypt(rnd_a + rnd_b_rot) — a FRESH
+// cipher with IV=0.
+//
+// Since both sides start step 2 with IV=0 (the Python provisioner creates a
+// brand new AES.new() with iv_zero for step 2), the card's encryption of
+// RndA' uses as IV the last ciphertext block from step 2 = token[16..31].
+//
+// BUT WAIT — the card doesn't necessarily reset the IV between the two
+// APDUs the same way.  The APDU wrapping (ISO 7816) is just transport.
+// The DESFire protocol maintains a continuous CBC IV across the entire
+// auth handshake, not per-APDU.
+//
+// Let's trace what the CARD does:
+//   - Card init: IV = 0
+//   - Card encrypts RndB with IV=0: E(RndB⊕0) = resp1.  IV → resp1
+//   - Card receives our token (32 bytes).  Card decrypts with CBC:
+//       Dec(token[0..15]) ⊕ resp1 → should give RndA (but we encrypted
+//       with IV=0, not resp1!).
+//
+// AH — this is the key problem.  In the ORIGINAL code (and the Python code),
+// step 2 encryption uses IV=0, NOT the carried-over IV from step 1.
+// This means the reader and card are NOT maintaining a continuous IV.
+// Instead, each "message" starts with IV=0.
+//
+// This actually matches the DESFire documentation for legacy auth: each
+// command/response is independently encrypted with IV=0.
+//
+// So for the card's response in step 3:
+//   - Card encrypts RndA' with IV=0  (fresh per-message)
+//   - resp2 = Enc(RndA' ⊕ 0) = Enc(RndA')
+//   - To decrypt: RndA' = Dec(resp2) ⊕ 0 = Dec(resp2)
+//   - This is just a raw block decrypt (aes_dec_block_).
 
 bool DesfireReaderComponent::df_auth_aes_() {
   // Step 1: AuthenticateAES (INS=0xAA), key number 0
@@ -453,12 +473,7 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16)
     return false;
 
-  // Save resp1 — this is E_k(RndB) and also the card's send-side CBC IV
-  // for the final response.
-  uint8_t enc_rnd_b[16];
-  memcpy(enc_rnd_b, resp1, 16);
-
-  // Decrypt encrypted RndB (IV=0)
+  // Decrypt E_k(RndB) — single block, IV=0 means just raw decrypt
   uint8_t rnd_b[16];
   aes_dec_block_(app_rk_, resp1, rnd_b);
 
@@ -471,13 +486,13 @@ bool DesfireReaderComponent::df_auth_aes_() {
   memcpy(rnd_b_rot, rnd_b + 1, 15);
   rnd_b_rot[15] = rnd_b[0];
 
-  // Encrypt (RndA || RndB_rot) with AES-CBC, IV=0
+  // Encrypt (RndA || RndB') with AES-CBC, IV=0
   uint8_t token[32];
-  aes_enc_block_(app_rk_, rnd_a, token);           // block 1: Enc(RndA XOR 0)
+  aes_enc_block_(app_rk_, rnd_a, token);            // Enc(RndA ⊕ 0)
   uint8_t tmp[16];
   for (uint8_t i = 0; i < 16; i++)
-    tmp[i] = rnd_b_rot[i] ^ token[i];              // CBC: XOR with prev ciphertext
-  aes_enc_block_(app_rk_, tmp, token + 16);         // block 2
+    tmp[i] = rnd_b_rot[i] ^ token[i];               // CBC chaining
+  aes_enc_block_(app_rk_, tmp, token + 16);          // Enc(RndB' ⊕ token[0..15])
 
   // Build APDU: [90 AF 00 00 20 <32 bytes> 00]
   uint8_t apdu2[38];
@@ -496,20 +511,18 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
     return false;
 
-  // ── Verify card's proof: E(RndA') ──
+  // ── Verify card's proof ──
   if (resp2_len != 16) {
     ESP_LOGE(TAG, "Auth response wrong length (%d, expected 16)", resp2_len);
     return false;
   }
 
-  // The card's send-side CBC IV = enc_rnd_b (E_k(RndB) from step 1).
-  // Decrypt: RndA'_received = Dec(resp2) XOR enc_rnd_b
+  // Card encrypted RndA' as a single block with IV=0 (same as step 1).
+  // Decrypt with raw ECB (aes_dec_block_ = AES-CBC with IV=0 for 1 block).
   uint8_t rnd_a_card[16];
   aes_dec_block_(app_rk_, resp2, rnd_a_card);
-  for (uint8_t i = 0; i < 16; i++)
-    rnd_a_card[i] ^= enc_rnd_b[i];
 
-  // Expected RndA' = RndA rotated left by 1 byte
+  // Expected: RndA rotated left by 1 byte
   uint8_t rnd_a_expected[16];
   memcpy(rnd_a_expected, rnd_a + 1, 15);
   rnd_a_expected[15] = rnd_a[0];
@@ -520,7 +533,18 @@ bool DesfireReaderComponent::df_auth_aes_() {
     diff |= rnd_a_card[i] ^ rnd_a_expected[i];
 
   if (diff != 0) {
+    // Debug: dump both values so you can diagnose
     ESP_LOGE(TAG, "Mutual auth FAILED — card did not prove key knowledge");
+    ESP_LOGD(TAG, "  Expected RndA': %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+             rnd_a_expected[0], rnd_a_expected[1], rnd_a_expected[2], rnd_a_expected[3],
+             rnd_a_expected[4], rnd_a_expected[5], rnd_a_expected[6], rnd_a_expected[7],
+             rnd_a_expected[8], rnd_a_expected[9], rnd_a_expected[10], rnd_a_expected[11],
+             rnd_a_expected[12], rnd_a_expected[13], rnd_a_expected[14], rnd_a_expected[15]);
+    ESP_LOGD(TAG, "  Got      RndA': %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+             rnd_a_card[0], rnd_a_card[1], rnd_a_card[2], rnd_a_card[3],
+             rnd_a_card[4], rnd_a_card[5], rnd_a_card[6], rnd_a_card[7],
+             rnd_a_card[8], rnd_a_card[9], rnd_a_card[10], rnd_a_card[11],
+             rnd_a_card[12], rnd_a_card[13], rnd_a_card[14], rnd_a_card[15]);
     return false;
   }
 

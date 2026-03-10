@@ -58,10 +58,8 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_uid_sensor(text_sensor::TextSensor *s)       { uid_sensor_ = s; }
 
  protected:
-  // ── PN532 I2C frame layer ���─
+  // ── PN532 I2C frame layer ──
   bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
-  // max_polls × 3 ms = worst-case blocking time for this call.
-  // Use ~20 for detect (~60 ms), ~80 for DESFire APDU (~240 ms).
   bool read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
                       uint8_t &resp_len, uint8_t max_polls = 80);
 
@@ -105,8 +103,8 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint32_t cooldown_until_{0};
   uint8_t  prev_uid_[7]{};
   uint8_t  prev_uid_len_{0};
-  bool     card_present_{false};  // true while card data is published
-  uint8_t  no_card_count_{0};    // consecutive no-card detects (debounce)
+  bool     card_present_{false};
+  uint8_t  no_card_count_{0};
 };
 
 }  // namespace desfire_reader
