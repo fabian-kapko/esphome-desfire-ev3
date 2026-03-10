@@ -1,43 +1,48 @@
-#pragma once
+import esphome.codegen as cg
+import esphome.config_validation as cv
+from esphome.components import pn532
+from esphome.const import CONF_ID
 
-#include <vector>
-#include <stdint.h>
+AUTO_LOAD = ["pn532"]
 
-class DesfireReader {
- public:
-  bool authenticate_aes(uint8_t key_no, const uint8_t *key);
-  bool read_file_secure(uint8_t file_no, uint32_t offset, uint32_t length, std::vector<uint8_t> &out);
+desfire_ns = cg.esphome_ns.namespace("desfire_reader")
+DesfireReader = desfire_ns.class_("DesfireReader", cg.Component)
 
- private:
-  bool desfire_apdu_(uint8_t ins,
-                     const std::vector<uint8_t> &tx,
-                     std::vector<uint8_t> &rx);
+CONF_PN532_ID = "pn532_id"
+CONF_APPLICATION_ID = "application_id"
+CONF_FILE_ID = "file_id"
+CONF_KEY_ID = "key_id"
+CONF_AUTHENTICATION_KEY = "authentication_key"
+CONF_DATA_KEY = "data_key"
 
-  void derive_session_key_(const uint8_t *rndA, const uint8_t *rndB);
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(DesfireReader),
 
-  void aes_cbc_encrypt_(const uint8_t *key,
-                        uint8_t *iv,
-                        const uint8_t *in,
-                        uint8_t *out,
-                        size_t len);
+        cv.Required(CONF_PN532_ID): cv.use_id(pn532.PN532),
 
-  void aes_cbc_decrypt_(const uint8_t *key,
-                        uint8_t *iv,
-                        const uint8_t *in,
-                        uint8_t *out,
-                        size_t len);
+        cv.Required(CONF_APPLICATION_ID): cv.hex_int,
+        cv.Required(CONF_FILE_ID): cv.int_range(min=0, max=31),
+        cv.Required(CONF_KEY_ID): cv.int_range(min=0, max=13),
 
-  void aes_cmac_(const uint8_t *key,
-                 const uint8_t *data,
-                 size_t len,
-                 uint8_t *out);
+        cv.Required(CONF_AUTHENTICATION_KEY): cv.string,
+        cv.Optional(CONF_DATA_KEY): cv.string,
+    }
+).extend(cv.COMPONENT_SCHEMA)
 
-  void rotate_left_(uint8_t *data, size_t len);
 
-  bool session_active_{false};
+async def to_code(config):
+    var = cg.new_Pvariable(config[CONF_ID])
+    await cg.register_component(var, config)
 
-  uint8_t session_key_[16];
-  uint8_t session_iv_[16];
+    pn = await cg.get_variable(config[CONF_PN532_ID])
+    cg.add(var.set_pn532(pn))
 
-  uint8_t auth_key_no_{0};
-};
+    cg.add(var.set_application_id(config[CONF_APPLICATION_ID]))
+    cg.add(var.set_file_id(config[CONF_FILE_ID]))
+    cg.add(var.set_key_id(config[CONF_KEY_ID]))
+
+    cg.add(var.set_authentication_key(config[CONF_AUTHENTICATION_KEY]))
+
+    if CONF_DATA_KEY in config:
+        cg.add(var.set_data_key(config[CONF_DATA_KEY]))
