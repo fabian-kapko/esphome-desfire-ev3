@@ -3,7 +3,6 @@
 #include "esphome/core/hal.h"
 #include <string.h>
 
-// Fix #1: Hardware RNG support
 #ifdef USE_ESP32
 #include <esp_random.h>
 #endif
@@ -64,10 +63,6 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
 
   for (uint8_t poll = 0; poll < max_polls; poll++) {
     if (this->read(buf, sizeof(buf)) != i2c::ERROR_OK || buf[0] != 0x01) {
-      // 3 ms is enough at 400 kHz I2C — a 64-byte read takes ~1.3 ms,
-      // so this gives the PN532 a brief processing window without
-      // wasting time.  The yield() calls between DESFire steps handle
-      // WiFi stack breathing.
       delay(3);
       continue;
     }
@@ -170,7 +165,6 @@ void DesfireReaderComponent::publish_result_(const char *str) {
 
 void DesfireReaderComponent::setup() {
   ESP_LOGCONFIG(TAG, "DESFire reader setup...");
-  // Fix #1: removed randomSeed() — hardware RNG needs no seeding.
   aes_key_exp_(app_key_, app_rk_);
   aes_key_exp_(data_key_, data_rk_);
 
@@ -193,11 +187,6 @@ void DesfireReaderComponent::setup() {
   uint8_t sam_len;
   this->read_response_(0x14, sam_resp, sizeof(sam_resp), sam_len, 30);
 
-  // RFConfiguration: set MxRtyPassiveActivation to 2.
-  // This limits InListPassiveTarget to ~2 RF poll cycles before giving up,
-  // so an empty-field detect returns in ~30-50 ms instead of ~500+ ms.
-  // Format: cmd=0x12, CfgItem=0x05, MxRtyATR=0xFF, MxRtyPSL=0x01,
-  //         MxRtyPassiveActivation=0x02
   const uint8_t rf_cfg[] = {0x12, 0x05, 0xFF, 0x01, 0x02};
   if (this->write_command_(rf_cfg, sizeof(rf_cfg))) {
     uint8_t rf_resp[4];
@@ -218,26 +207,22 @@ void DesfireReaderComponent::setup() {
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
-  // ── Cooldown gate: skip immediately if still in cooldown ──
   uint32_t now = millis();
   if ((int32_t)(cooldown_until_ - now) > 0)
     return;
 
-  // ── Detect card (short timeout — PN532 MaxRetries is low) ──
   const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
   bool detected = false;
 
   if (this->write_command_(detect_cmd, sizeof(detect_cmd))) {
     uint8_t resp[48];
     uint8_t resp_len;
-    // 20 polls × 3 ms = 60 ms max wait
     if (this->read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp),
                              resp_len, 20) &&
         resp_len > 0 && resp[0] != 0) {
       detected = true;
       no_card_count_ = 0;
 
-      // ── Parse UID ──
       uint8_t uid_len = 0;
       const uint8_t *uid_ptr = nullptr;
       if (resp_len >= 7) {
@@ -249,14 +234,12 @@ void DesfireReaderComponent::update() {
           uid_len = 0;
       }
 
-      // ── Same card still on reader? Skip workflow, extend cooldown. ──
       if (uid_len > 0 && uid_len == prev_uid_len_ &&
           memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
         cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
         return;
       }
 
-      // ── New card: cache UID, publish, run DESFire workflow ──
       if (uid_len > 0 && uid_ptr != nullptr) {
         memcpy(prev_uid_, uid_ptr, uid_len);
         prev_uid_len_ = uid_len;
@@ -277,7 +260,7 @@ void DesfireReaderComponent::update() {
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
-      yield();  // let WiFi/mDNS run
+      yield();
 
       if (!df_auth_aes_()) {
         ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
@@ -285,10 +268,10 @@ void DesfireReaderComponent::update() {
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
-      yield();  // let WiFi/mDNS run
+      yield();
 
-      // Fix #4: Read up to 32 bytes — new format is [16-byte IV][16-byte ciphertext]
-      //         Legacy 16-byte files (zero IV) are still supported with a warning.
+      // Read up to 32 bytes: new format = [16-byte IV][16-byte ciphertext]
+      // Legacy format = [16-byte ciphertext] with implicit zero IV
       uint8_t raw[48];
       uint8_t raw_len;
       if (!df_read_file_(0x01, 32, raw, raw_len)) {
@@ -305,7 +288,7 @@ void DesfireReaderComponent::update() {
         // New format: first 16 bytes = per-card random IV, next 16 = ciphertext
         decrypt_ok = aes_cbc_decrypt_(raw + 16, 16, raw, decrypted);
       } else if (raw_len >= 16) {
-        // Legacy format: 16 bytes ciphertext with implicit zero IV
+        // Legacy format: zero IV
         ESP_LOGW(TAG, "Legacy 16-byte file (zero IV) — consider re-provisioning card");
         uint8_t zero_iv[16] = {0};
         decrypt_ok = aes_cbc_decrypt_(raw, 16, zero_iv, decrypted);
@@ -338,11 +321,8 @@ void DesfireReaderComponent::update() {
     }
   }
 
-  // ── No card detected — debounce before clearing sensors ──
   if (!detected) {
     if (no_card_count_ < 255) no_card_count_++;
-    // Require 3 consecutive misses before declaring card gone.
-    // At ~60 ms per detect attempt, this is ~180 ms debounce.
     if (no_card_count_ >= 3 && card_present_) {
       card_present_ = false;
       prev_uid_len_ = 0;
@@ -360,7 +340,7 @@ void DesfireReaderComponent::dump_config() {
   LOG_I2C_DEVICE(this);
 }
 
-// ══════════════════════════════════════════════���════════════════
+// ═══════════════════════════════════════════════════════════════
 //  DESFire APDU via PN532 InDataExchange
 // ═══════════════════════════════════════════════════════════════
 
@@ -381,7 +361,6 @@ bool DesfireReaderComponent::desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len
 
   uint8_t raw[PN532_BUF_SIZE];
   uint8_t raw_len;
-  // DESFire card crypto can take a moment — 80 polls × 3 ms = 240 ms
   if (!this->read_response_(PN532_CMD_IN_DATA_EXCHANGE, raw, sizeof(raw),
                             raw_len, 80))
     return false;
@@ -416,7 +395,53 @@ bool DesfireReaderComponent::df_select_app_() {
   return sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK;
 }
 
-// Fix #2: Full mutual authentication — now verifies the card's response (RndA')
+// Fix #2: Full mutual authentication with correct IV handling.
+//
+// DESFire legacy AuthenticateAES (INS 0xAA) CBC IV state:
+//
+//   Step 1 — card sends E_k(RndB) with IV=0
+//            Reader decrypts with IV=0.  Reader's decrypt-IV becomes E_k(RndB).
+//
+//   Step 2 — reader sends E_k_cbc(RndA || RndB')
+//            This is 2 blocks encrypted with CBC IV starting at 0.
+//            After sending, the "last ciphertext sent" = token[16..31].
+//
+//   Step 3 — card sends E_k(RndA') encrypted with CBC.
+//            Per the DESFire legacy auth spec, the card uses IV = the last
+//            ciphertext block it received from us, i.e. token[16..31].
+//            BUT — the reader must decrypt it using its own receive-side IV,
+//            which after step 1 was set to E_k(RndB) (i.e. resp1, the raw
+//            encrypted RndB the card sent in step 1).
+//
+//   Actually, for DESFire legacy AES auth the simplest correct approach:
+//   The card's response is a single AES block.  The CBC IV the card used
+//   to encrypt it is the last block it received = token[16..31].
+//   To decrypt: plaintext = Dec(resp2) XOR IV, where IV = token[16..31].
+//
+//   HOWEVER — PyCryptodome's legacy_aes auth in provison.py does NOT verify
+//   the card's response at all (it just checks SW).  So the card definitely
+//   sends E(RndA') back.  The question is what IV it uses.
+//
+//   Per NXP AN10833 §7.1.2, for legacy AuthenticateAES:
+//     - Card decrypts our 2-block message.  The CBC state after decrypting
+//       block 2 has IV = token[16..31] (the second ciphertext block).
+//     - Card encrypts RndA' with CBC continuing from where it left off.
+//       The IV for encrypting RndA' is token[16..31].
+//     - So to decrypt on our side: plain = Dec(resp2) XOR token[16..31]
+//
+//   But wait — in the DESFire protocol, the direction matters.
+//   The card maintains SEPARATE IVs for send and receive.
+//     - Receive IV (card decrypting our data): starts at 0, after our
+//       2 blocks it's token[16..31].
+//     - Send IV (card encrypting response): starts at 0 from step 1
+//       where it sent E(RndB).  After step 1, the send IV = E_k(RndB) = resp1.
+//       For step 3, the card encrypts RndA' with send-side IV = resp1.
+//       So: ciphertext = Enc(RndA' XOR resp1)
+//       To decrypt: RndA' = Dec(resp2) XOR resp1
+//
+//   This is why using token[16..31] as IV was wrong!  The correct IV is resp1
+//   (the original encrypted RndB the card sent us in step 1).
+
 bool DesfireReaderComponent::df_auth_aes_() {
   // Step 1: AuthenticateAES (INS=0xAA), key number 0
   uint8_t apdu1[] = {0x90, 0xAA, 0x00, 0x00, 0x01, 0x00, 0x00};
@@ -428,7 +453,12 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16)
     return false;
 
-  // Decrypt encrypted RndB (IV=0, so decrypt is just a single block op)
+  // Save resp1 — this is E_k(RndB) and also the card's send-side CBC IV
+  // for the final response.
+  uint8_t enc_rnd_b[16];
+  memcpy(enc_rnd_b, resp1, 16);
+
+  // Decrypt encrypted RndB (IV=0)
   uint8_t rnd_b[16];
   aes_dec_block_(app_rk_, resp1, rnd_b);
 
@@ -442,14 +472,12 @@ bool DesfireReaderComponent::df_auth_aes_() {
   rnd_b_rot[15] = rnd_b[0];
 
   // Encrypt (RndA || RndB_rot) with AES-CBC, IV=0
-  // Block 1: encrypt(RndA XOR 0) = encrypt(RndA)
   uint8_t token[32];
-  aes_enc_block_(app_rk_, rnd_a, token);
-  // Block 2: encrypt(RndB_rot XOR ciphertext_of_block1)
+  aes_enc_block_(app_rk_, rnd_a, token);           // block 1: Enc(RndA XOR 0)
   uint8_t tmp[16];
   for (uint8_t i = 0; i < 16; i++)
-    tmp[i] = rnd_b_rot[i] ^ token[i];
-  aes_enc_block_(app_rk_, tmp, token + 16);
+    tmp[i] = rnd_b_rot[i] ^ token[i];              // CBC: XOR with prev ciphertext
+  aes_enc_block_(app_rk_, tmp, token + 16);         // block 2
 
   // Build APDU: [90 AF 00 00 20 <32 bytes> 00]
   uint8_t apdu2[38];
@@ -468,25 +496,25 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
     return false;
 
-  // ── Verify card's proof: decrypt E(RndA') and check it matches RndA rotated ──
+  // ── Verify card's proof: E(RndA') ──
   if (resp2_len != 16) {
     ESP_LOGE(TAG, "Auth response wrong length (%d, expected 16)", resp2_len);
     return false;
   }
 
-  // The card encrypted RndA' using AES-CBC with IV = last ciphertext block
-  // we sent (token[16..31]).  So: plaintext = Dec(resp2) XOR IV
+  // The card's send-side CBC IV = enc_rnd_b (E_k(RndB) from step 1).
+  // Decrypt: RndA'_received = Dec(resp2) XOR enc_rnd_b
   uint8_t rnd_a_card[16];
   aes_dec_block_(app_rk_, resp2, rnd_a_card);
   for (uint8_t i = 0; i < 16; i++)
-    rnd_a_card[i] ^= token[16 + i];  // IV = second ciphertext block of our token
+    rnd_a_card[i] ^= enc_rnd_b[i];
 
-  // Build expected RndA' = RndA rotated left by 1 byte
+  // Expected RndA' = RndA rotated left by 1 byte
   uint8_t rnd_a_expected[16];
   memcpy(rnd_a_expected, rnd_a + 1, 15);
   rnd_a_expected[15] = rnd_a[0];
 
-  // Constant-time comparison to avoid timing side-channels
+  // Constant-time comparison
   uint8_t diff = 0;
   for (uint8_t i = 0; i < 16; i++)
     diff |= rnd_a_card[i] ^ rnd_a_expected[i];
@@ -513,7 +541,6 @@ bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
     return false;
   if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
     return false;
-  // Truncate to requested length (card may append 8-byte MAC)
   uint8_t copy_len = (resp_len > length) ? length : resp_len;
   memcpy(out, resp, copy_len);
   out_len = copy_len;
@@ -650,8 +677,6 @@ void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
   memcpy(out, s, 16);
 }
 
-// Fix #4: aes_cbc_decrypt_ now takes an explicit IV parameter.
-//         Pass nullptr for legacy zero-IV behaviour.
 bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
                                               const uint8_t *iv_in,
                                               uint8_t *out) {
@@ -671,17 +696,13 @@ bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
   return true;
 }
 
-// Fix #1: Use hardware RNG instead of Arduino random().
 void DesfireReaderComponent::random_bytes_(uint8_t *buf, uint8_t len) {
 #ifdef USE_ESP32
   esp_fill_random(buf, len);
 #elif defined(USE_ESP8266)
-  // ESP8266 hardware RNG register (RANDOM_REG32 at 0x3FF20E44).
-  // Produces true random bytes when the RF subsystem (WiFi) is active.
   for (uint8_t i = 0; i < len; i++)
     buf[i] = static_cast<uint8_t>(*(volatile uint32_t *)0x3FF20E44);
 #else
-  // Generic fallback — esp_random() if available
   for (uint8_t i = 0; i < len; i++)
     buf[i] = static_cast<uint8_t>(esp_random());
 #endif

@@ -58,7 +58,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_uid_sensor(text_sensor::TextSensor *s)       { uid_sensor_ = s; }
 
  protected:
-  // ── PN532 I2C frame layer ──
+  // ── PN532 I2C frame layer ���─
   bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
   // max_polls × 3 ms = worst-case blocking time for this call.
   // Use ~20 for detect (~60 ms), ~80 for DESFire APDU (~240 ms).
@@ -74,7 +74,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   bool df_read_file_(uint8_t file_id, uint8_t length,
                      uint8_t *out, uint8_t &out_len);
 
-  // Fix #4: IV is now an explicit parameter (nullptr = zero IV fallback)
   bool aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
                         const uint8_t *iv, uint8_t *out);
   void random_bytes_(uint8_t *buf, uint8_t len);
