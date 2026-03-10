@@ -21,14 +21,17 @@ static const uint8_t DESFIRE_OK          = 0x00;
 static const uint8_t DESFIRE_MORE_FRAMES = 0xAF;
 static const uint8_t PN532_CMD_IN_DATA_EXCHANGE = 0x40;
 static const uint8_t PN532_CMD_IN_LIST_PASSIVE  = 0x4A;
+static const uint8_t PN532_CMD_IN_RELEASE       = 0x52;
 
 static const uint8_t PN532_BUF_SIZE = 64;
 
 // Cooldowns (ms)
-static const uint16_t COOLDOWN_SUCCESS_MS   = 150;   // was 500 — faster re-detect of same card
-static const uint16_t COOLDOWN_FAIL_BASE_MS = 100;   // was 200 — faster retry
-static const uint32_t COOLDOWN_FAIL_MAX_MS  = 5000;  // was 30000 — cap at 5s not 30s
-static const uint8_t  NO_CARD_THRESHOLD     = 2;     // was 3 — faster card-removed detection
+static const uint16_t COOLDOWN_SUCCESS_MS   = 150;
+static const uint16_t COOLDOWN_RETRY_MS     = 30;    // retry after transient fail
+static const uint16_t COOLDOWN_FAIL_BASE_MS = 100;
+static const uint32_t COOLDOWN_FAIL_MAX_MS  = 5000;
+static const uint8_t  NO_CARD_THRESHOLD     = 2;
+static const uint8_t  MAX_RETRIES           = 2;     // retry auth this many times before giving up
 
 // Forward declarations of standalone AES helpers (defined in .cpp)
 void aes_key_exp_(const uint8_t *key, uint8_t *rk);
@@ -49,6 +52,8 @@ enum class NfcState : uint8_t {
   READ_WAIT_ACK,
   READ_WAIT_RESP,
   PUBLISH,
+  RELEASE_WAIT_ACK,     // release target after fail, then re-detect
+  RELEASE_WAIT_RESP,
 };
 
 class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
@@ -102,9 +107,12 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void publish_auth_(bool state);
   void publish_result_(const char *str);
 
-  void handle_fail_();
+  void handle_fail_();          // hard fail — give up on this card
+  void handle_retry_();         // transient fail — release target and retry
   void reset_to_idle_(uint32_t cooldown_ms);
   void clear_card_state_();
+  void start_release_();        // send InRelease to reset PN532 target state
+  void start_select_app_();     // begin SelectApp (reused for retries)
 
   // ── Config ──
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
@@ -135,6 +143,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   bool     card_present_{false};
   uint8_t  no_card_count_{0};
   uint8_t  consecutive_fails_{0};
+  uint8_t  retry_count_{0};          // retries for current card
 
   // ── Carried between states ──
   char     current_uid_str_[24]{};
@@ -148,10 +157,10 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t  raw_file_[48]{};
   uint8_t  raw_file_len_{0};
 
-  // ── Timeouts — tuned for PN532 actual response times ──
-  static const uint16_t ACK_TIMEOUT_MS    = 50;    // was 150 — PN532 ACKs within 5ms normally
-  static const uint16_t RESP_TIMEOUT_MS   = 150;   // was 500 — PN532 responds within 50ms normally
-  static const uint16_t DETECT_TIMEOUT_MS = 200;   // detection can take longer (RF field scan)
+  // ── Timeouts ──
+  static const uint16_t ACK_TIMEOUT_MS    = 50;
+  static const uint16_t RESP_TIMEOUT_MS   = 150;
+  static const uint16_t DETECT_TIMEOUT_MS = 200;
 };
 
 }  // namespace desfire_reader
