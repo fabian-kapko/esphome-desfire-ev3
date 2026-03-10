@@ -14,7 +14,7 @@ DesfireReaderComponent = desfire_ns.class_(
 
 CONF_APP_ID   = "app_id"
 CONF_APP_KEY  = "app_key"   # AES-128 key for app authentication
-CONF_DATA_KEY = "data_key"  # AES-128 key to decrypt file contents
+CONF_DATA_KEY = "data_key"  # Deprecated: no longer used (kept for backward compatibility)
 CONF_RESULT   = "result"
 CONF_AUTH_OK  = "auth_ok"
 CONF_UID      = "uid"
@@ -37,7 +37,7 @@ CONFIG_SCHEMA = (
         cv.GenerateID(): cv.declare_id(DesfireReaderComponent),
         cv.Required(CONF_APP_ID):   validate_hex_bytes(3,  "app_id"),
         cv.Required(CONF_APP_KEY):  validate_hex_bytes(16, "app_key"),
-        cv.Required(CONF_DATA_KEY): validate_hex_bytes(16, "data_key"),
+        cv.Optional(CONF_DATA_KEY): validate_hex_bytes(16, "data_key"),
         cv.Optional(CONF_RESULT):   text_sensor.text_sensor_schema(),
         cv.Optional(CONF_AUTH_OK):  binary_sensor.binary_sensor_schema(),
         cv.Optional(CONF_UID):      text_sensor.text_sensor_schema(),
@@ -56,7 +56,9 @@ async def to_code(config):
     cg.add(var.set_app_id(aid[0], aid[1], aid[2]))
 
     cg.add(var.set_app_key(config[CONF_APP_KEY]))
-    cg.add(var.set_data_key(config[CONF_DATA_KEY]))
+
+    if CONF_DATA_KEY in config:
+        cg.add(var.set_data_key(config[CONF_DATA_KEY]))
 
     if CONF_RESULT in config:
         sens = await text_sensor.new_text_sensor(config[CONF_RESULT])

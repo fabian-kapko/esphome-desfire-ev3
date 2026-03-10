@@ -70,9 +70,14 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
                      uint8_t *response, uint8_t resp_cap,
                      uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
   bool df_select_app_();
-  bool df_auth_aes_();
+  bool df_auth_ev2_first_();
   bool df_read_file_(uint8_t file_id, uint8_t length,
                      uint8_t *out, uint8_t &out_len);
+
+  // AES-CMAC (NIST SP 800-38B / OMAC1).
+  // init_vec: optional non-zero initial chaining value (nullptr = all-zeros).
+  void cmac_(const uint8_t *rk, const uint8_t *msg, uint8_t msg_len,
+             uint8_t *mac_out, const uint8_t *init_vec);
 
   bool aes_cbc_decrypt_(const uint8_t *in, uint8_t len, uint8_t *out);
   void random_bytes_(uint8_t *buf, uint8_t len);
@@ -89,6 +94,12 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t data_key_[16]{};
   uint8_t app_rk_[176]{};
   uint8_t data_rk_[176]{};
+
+  // ── EV2 session state (populated after df_auth_ev2_first_()) ──
+  uint8_t ses_enc_rk_[176]{};  // KSesAuthEnc round keys
+  uint8_t ses_mac_rk_[176]{};  // KSesAuthMAC round keys
+  uint8_t ti_[4]{};            // Transaction Identifier
+  uint16_t cmd_ctr_{0};        // Command Counter
 
   // ── Sensors ──
   text_sensor::TextSensor     *result_sensor_{nullptr};

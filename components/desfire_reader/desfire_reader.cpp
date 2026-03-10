@@ -274,15 +274,15 @@ void DesfireReaderComponent::update() {
       }
       yield();  // let WiFi/mDNS run
 
-      if (!df_auth_aes_()) {
-        ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
+      if (!df_auth_ev2_first_()) {
+        ESP_LOGE(TAG, "EV2 auth FAILED — wrong app key?");
         publish_auth_(false);
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
       yield();  // let WiFi/mDNS run
 
-      uint8_t raw[32];
+      uint8_t raw[48];  // holds up to 32 bytes of plaintext after padding strip
       uint8_t raw_len;
       if (!df_read_file_(0x01, 16, raw, raw_len)) {
         ESP_LOGE(TAG, "ReadFile FAILED");
@@ -298,19 +298,11 @@ void DesfireReaderComponent::update() {
         return;
       }
 
-      uint8_t decrypted[16];
-      if (!aes_cbc_decrypt_(raw, 16, decrypted)) {
-        ESP_LOGE(TAG, "AES decrypt FAILED");
-        publish_auth_(false);
-        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
-        return;
-      }
-
-      // Extract printable ASCII
+      // Extract printable ASCII (raw already contains decrypted plaintext)
       char result[17];
       uint8_t rlen = 0;
-      for (uint8_t i = 0; i < 16 && decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
-        result[rlen++] = (char)decrypted[i];
+      for (uint8_t i = 0; i < 16 && raw[i] >= 0x20 && raw[i] <= 0x7E; i++)
+        result[rlen++] = (char)raw[i];
       result[rlen] = '\0';
 
       ESP_LOGI(TAG, "SUCCESS — '%s'", result);
@@ -399,9 +391,10 @@ bool DesfireReaderComponent::df_select_app_() {
   return sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK;
 }
 
-bool DesfireReaderComponent::df_auth_aes_() {
-  // Step 1: AuthenticateAES (INS=0xAA), key number 0
-  uint8_t apdu1[] = {0x90, 0xAA, 0x00, 0x00, 0x01, 0x00, 0x00};
+bool DesfireReaderComponent::df_auth_ev2_first_() {
+  // Step 1: AuthenticateEV2First Part 1 (INS=0x71), key number 0
+  // APDU: 90 71 00 00 02 <keyNo=0x00> <PCDcap2Len=0x00> 00
+  uint8_t apdu1[] = {0x90, 0x71, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00};
   uint8_t resp1[32];
   uint8_t resp1_len, sw1, sw2;
 
@@ -410,7 +403,7 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16)
     return false;
 
-  // Decrypt encrypted RndB (IV=0, so decrypt is just a single block op)
+  // Decrypt RndB using AES-ECB with app_key_ (IV=0 → single block decrypt)
   uint8_t rnd_b[16];
   aes_dec_block_(app_rk_, resp1, rnd_b);
 
@@ -418,22 +411,22 @@ bool DesfireReaderComponent::df_auth_aes_() {
   uint8_t rnd_a[16];
   random_bytes_(rnd_a, 16);
 
-  // Rotate RndB left by 1 byte
+  // Rotate RndB left by 1 byte → RndB'
   uint8_t rnd_b_rot[16];
   memcpy(rnd_b_rot, rnd_b + 1, 15);
   rnd_b_rot[15] = rnd_b[0];
 
-  // Encrypt (RndA || RndB_rot) with AES-CBC, IV=0
-  // Block 1: encrypt(RndA XOR 0) = encrypt(RndA)
+  // Encrypt (RndA || RndB') with AES-CBC (IV=0, key=app_key_)
+  // Block 1: AES_Enc(RndA XOR 0)
   uint8_t token[32];
   aes_enc_block_(app_rk_, rnd_a, token);
-  // Block 2: encrypt(RndB_rot XOR ciphertext_of_block1)
+  // Block 2: AES_Enc(RndB' XOR block1_ciphertext)
   uint8_t tmp[16];
   for (uint8_t i = 0; i < 16; i++)
     tmp[i] = rnd_b_rot[i] ^ token[i];
   aes_enc_block_(app_rk_, tmp, token + 16);
 
-  // Build APDU: [90 AF 00 00 20 <32 bytes> 00]
+  // Step 2: Send Part 2 — 90 AF 00 00 20 <32-byte-token> 00
   uint8_t apdu2[38];
   apdu2[0] = 0x90;
   apdu2[1] = 0xAF;
@@ -447,26 +440,154 @@ bool DesfireReaderComponent::df_auth_aes_() {
   uint8_t resp2_len;
   if (!desfire_apdu_(apdu2, sizeof(apdu2), resp2, sizeof(resp2), resp2_len, sw1, sw2))
     return false;
-  return (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK);
+  if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK) || resp2_len != 32)
+    return false;
+
+  // Step 3: Decrypt response with AES-CBC (IV = token[16..31])
+  // Block 1: AES_Dec(resp2[0..15]) XOR token[16..31]  → should be RndA rotated left
+  uint8_t dec1[16], dec2[16];
+  aes_dec_block_(app_rk_, resp2, dec1);
+  for (uint8_t i = 0; i < 16; i++)
+    dec1[i] ^= token[16 + i];
+  // Block 2: AES_Dec(resp2[16..31]) XOR resp2[0..15]  → TI || PDcap2 || PCDcap2
+  aes_dec_block_(app_rk_, resp2 + 16, dec2);
+  for (uint8_t i = 0; i < 16; i++)
+    dec2[i] ^= resp2[i];
+
+  // Verify dec1 == RndA rotated left by 1 byte
+  if (dec1[15] != rnd_a[0])
+    return false;
+  for (uint8_t i = 0; i < 15; i++)
+    if (dec1[i] != rnd_a[i + 1])
+      return false;
+
+  // Extract Transaction Identifier (first 4 bytes of dec2)
+  memcpy(ti_, dec2, 4);
+
+  // ── Session key derivation per NXP AN12196 ──
+  // SV1 (KSesAuthEnc) = A5 5A 00 01 00 80
+  //                     || RndA[0..1]
+  //                     || (RndA[2..7] XOR RndB[0..5])
+  //                     || RndB[6..15]
+  //                     || RndA[8..15]
+  // Note: NXP's range notation [15..8] is big-endian (bit 127 = byte 0 = most
+  // significant). In C-array terms: index 0 is the first/leftmost byte and the
+  // ranges map directly (RndA[0..1] = C indices 0 and 1, etc.).
+  uint8_t sv[32];
+  sv[0] = 0xA5; sv[1] = 0x5A; sv[2] = 0x00; sv[3] = 0x01; sv[4] = 0x00; sv[5] = 0x80;
+  sv[6] = rnd_a[0];
+  sv[7] = rnd_a[1];
+  for (uint8_t i = 0; i < 6; i++)
+    sv[8 + i] = rnd_a[2 + i] ^ rnd_b[i];
+  for (uint8_t i = 0; i < 10; i++)
+    sv[14 + i] = rnd_b[6 + i];
+  for (uint8_t i = 0; i < 8; i++)
+    sv[24 + i] = rnd_a[8 + i];
+
+  // KSesAuthEnc = CMAC(app_key_, SV1)  — standard CMAC (IV = 0)
+  uint8_t k_enc[16];
+  cmac_(app_rk_, sv, 32, k_enc, nullptr);
+  aes_key_exp_(k_enc, ses_enc_rk_);
+
+  // SV2 (KSesAuthMAC) = 5A A5 00 01 00 80 || (same nonce bytes as SV1)
+  sv[0] = 0x5A; sv[1] = 0xA5;
+  uint8_t k_mac[16];
+  cmac_(app_rk_, sv, 32, k_mac, nullptr);
+  aes_key_exp_(k_mac, ses_mac_rk_);
+
+  // Reset command counter after successful auth
+  cmd_ctr_ = 0;
+
+  ESP_LOGD(TAG, "EV2 auth OK — TI: %02X%02X%02X%02X",
+           ti_[0], ti_[1], ti_[2], ti_[3]);
+  return true;
 }
 
 bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
                                            uint8_t *out, uint8_t &out_len) {
   uint8_t apdu[] = {
       0x90, 0xBD, 0x00, 0x00, 0x07, file_id,
-      0x00, 0x00, 0x00,
-      length, 0x00, 0x00,
+      0x00, 0x00, 0x00,    // offset = 0 (LE24)
+      length, 0x00, 0x00,  // length (LE24)
       0x00};
-  uint8_t resp[48];
+  uint8_t resp[56];  // max enc data (48) + CMAC (8)
   uint8_t resp_len, sw1, sw2;
   if (!desfire_apdu_(apdu, sizeof(apdu), resp, sizeof(resp), resp_len, sw1, sw2))
     return false;
   if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
     return false;
-  // Truncate to requested length (card may append 8-byte MAC)
-  uint8_t copy_len = (resp_len > length) ? length : resp_len;
-  memcpy(out, resp, copy_len);
+
+  // CommMode.Full: response = E(data+ISO_padding) || 8-byte truncated CMAC
+  // Minimum: one 16-byte AES block of encrypted data + 8-byte CMAC = 24 bytes.
+  if (resp_len < 24)
+    return false;
+  uint8_t enc_len = resp_len - 8;
+  if (enc_len % 16 != 0)
+    return false;
+
+  // ── Compute ENC IV: AES_Enc(KSesAuthEnc, 5A A5 || TI || CmdCtr_LE16 || 00^8) ──
+  uint8_t iv_input[16] = {
+      0x5A, 0xA5,
+      ti_[0], ti_[1], ti_[2], ti_[3],
+      (uint8_t)(cmd_ctr_ & 0xFF), (uint8_t)((cmd_ctr_ >> 8) & 0xFF),
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  uint8_t enc_iv[16];
+  aes_enc_block_(ses_enc_rk_, iv_input, enc_iv);
+
+  // ── AES-CBC decrypt (key = KSesAuthEnc, IV = enc_iv) ──
+  uint8_t plain[48];
+  uint8_t cbc_iv[16];
+  memcpy(cbc_iv, enc_iv, 16);
+  for (uint8_t b = 0; b < enc_len; b += 16) {
+    uint8_t blk[16];
+    aes_dec_block_(ses_enc_rk_, resp + b, blk);
+    for (uint8_t i = 0; i < 16; i++)
+      blk[i] ^= cbc_iv[i];
+    memcpy(plain + b, blk, 16);
+    memcpy(cbc_iv, resp + b, 16);
+  }
+
+  // ── Strip ISO/IEC 7816-4 padding: find rightmost 0x80 ──
+  uint8_t plain_len = enc_len;
+  for (int8_t i = (int8_t)(enc_len - 1); i >= 0; i--) {
+    if (plain[i] == 0x80) {
+      plain_len = (uint8_t)i;
+      break;
+    }
+    if (plain[i] != 0x00)
+      break;
+  }
+
+  // ── Verify truncated CMAC ──
+  // MAC IV: AES_Enc(KSesAuthMAC, A5 5A || TI || CmdCtr_LE16 || 00^8)
+  iv_input[0] = 0xA5;
+  iv_input[1] = 0x5A;
+  uint8_t mac_iv[16];
+  aes_enc_block_(ses_mac_rk_, iv_input, mac_iv);
+
+  // CMAC input: response code (0x00) || plain_data  (1 + up to 48 bytes)
+  uint8_t mac_input[1 + sizeof(plain)];
+  mac_input[0] = 0x00;
+  memcpy(mac_input + 1, plain, plain_len);
+  uint8_t computed_cmac[16];
+  cmac_(ses_mac_rk_, mac_input, (uint8_t)(1 + plain_len), computed_cmac, mac_iv);
+
+  // Truncate: take bytes at odd indices [1,3,5,7,9,11,13,15]
+  uint8_t mac_t[8];
+  for (uint8_t i = 0; i < 8; i++)
+    mac_t[i] = computed_cmac[2 * i + 1];
+
+  if (memcmp(mac_t, resp + enc_len, 8) != 0) {
+    ESP_LOGE(TAG, "CMAC verification FAILED");
+    return false;
+  }
+
+  // Copy plaintext to caller's buffer
+  uint8_t copy_len = (plain_len < length) ? plain_len : length;
+  memcpy(out, plain, copy_len);
   out_len = copy_len;
+
+  cmd_ctr_++;
   return true;
 }
 
@@ -612,6 +733,79 @@ bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
     memcpy(iv, in + b, 16);
   }
   return true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  AES-CMAC (NIST SP 800-38B / OMAC1)
+// ═══════════════════════════════════════════════════════════════
+
+void DesfireReaderComponent::cmac_(const uint8_t *rk, const uint8_t *msg,
+                                   uint8_t msg_len, uint8_t *mac_out,
+                                   const uint8_t *init_vec) {
+  // Derive subkeys: L = AES(K, 0^16)
+  uint8_t L[16] = {0};
+  aes_enc_block_(rk, L, L);
+
+  // K1 = L << 1; if MSB(L) set, XOR with Rb=0x87
+  uint8_t K1[16], K2[16];
+  bool msb = (L[0] & 0x80) != 0;
+  for (uint8_t i = 0; i < 15; i++)
+    K1[i] = (uint8_t)((L[i] << 1) | (L[i + 1] >> 7));
+  K1[15] = L[15] << 1;
+  if (msb)
+    K1[15] ^= 0x87;
+
+  // K2 = K1 << 1; if MSB(K1) set, XOR with Rb=0x87
+  msb = (K1[0] & 0x80) != 0;
+  for (uint8_t i = 0; i < 15; i++)
+    K2[i] = (uint8_t)((K1[i] << 1) | (K1[i + 1] >> 7));
+  K2[15] = K1[15] << 1;
+  if (msb)
+    K2[15] ^= 0x87;
+
+  // Number of blocks (at least 1) and whether the last block is complete
+  uint8_t n;
+  bool flag;
+  if (msg_len == 0) {
+    n = 1;
+    flag = false;
+  } else {
+    n = (uint8_t)((msg_len + 15) / 16);
+    flag = ((msg_len % 16) == 0);
+  }
+
+  // Prepare the last block (XOR with K1 or K2 depending on completeness)
+  uint8_t M_last[16];
+  if (flag) {
+    for (uint8_t i = 0; i < 16; i++)
+      M_last[i] = msg[(n - 1) * 16 + i] ^ K1[i];
+  } else {
+    uint8_t rem = msg_len % 16;
+    for (uint8_t i = 0; i < 16; i++) {
+      uint8_t b;
+      if (i < rem)
+        b = msg[(n - 1) * 16 + i];
+      else if (i == rem)
+        b = 0x80;
+      else
+        b = 0x00;
+      M_last[i] = b ^ K2[i];
+    }
+  }
+
+  // CBC-MAC: start from init_vec (or all-zeros if nullptr)
+  uint8_t X[16] = {0};
+  if (init_vec)
+    memcpy(X, init_vec, 16);
+
+  for (uint8_t i = 0; i < (uint8_t)(n - 1); i++) {
+    for (uint8_t j = 0; j < 16; j++)
+      X[j] ^= msg[i * 16 + j];
+    aes_enc_block_(rk, X, X);
+  }
+  for (uint8_t j = 0; j < 16; j++)
+    X[j] ^= M_last[j];
+  aes_enc_block_(rk, X, mac_out);
 }
 
 void DesfireReaderComponent::random_bytes_(uint8_t *buf, uint8_t len) {
