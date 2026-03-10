@@ -7,6 +7,12 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include <string.h>
 
+#ifdef USE_ESP32
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#endif
+
 namespace esphome {
 namespace desfire_reader {
 
@@ -21,13 +27,29 @@ static const uint8_t PN532_CMD_IN_LIST_PASSIVE  = 0x4A;
 static const uint8_t PN532_BUF_SIZE = 64;
 
 // Cooldowns (ms)
-static const uint16_t COOLDOWN_SUCCESS_MS = 500;
-static const uint16_t COOLDOWN_FAIL_MS    = 200;
+static const uint16_t COOLDOWN_SUCCESS_MS   = 500;
+static const uint16_t COOLDOWN_FAIL_BASE_MS = 200;
+static const uint32_t COOLDOWN_FAIL_MAX_MS  = 30000;
+
+// NFC task config
+static const uint8_t  NFC_TASK_CORE       = 1;     // core 1 — keeps core 0 free for WiFi
+static const uint16_t NFC_TASK_STACK      = 4096;
+static const uint8_t  NFC_TASK_PRIORITY   = 1;     // just above idle
+static const uint16_t NFC_POLL_INTERVAL_MS = 100;   // how often the task polls for cards
 
 // Forward declarations of standalone AES helpers (defined in .cpp)
 void aes_key_exp_(const uint8_t *key, uint8_t *rk);
 void aes_enc_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
 void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
+
+// ── Data passed from NFC task → main loop ──
+struct NfcResult {
+  bool     has_update;       // true when task produced new data
+  bool     auth_ok;
+  char     uid[24];
+  char     result[50];
+  bool     card_removed;
+};
 
 class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
  public:
@@ -43,9 +65,11 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
 
   // Overloads for vector (Python codegen sends std::vector)
   void set_app_key(const std::vector<uint8_t> &key) {
+    if (key.size() < 16) return;
     for (int i = 0; i < 16; i++) app_key_[i] = key[i];
   }
   void set_data_key(const std::vector<uint8_t> &key) {
+    if (key.size() < 16) return;
     for (int i = 0; i < 16; i++) data_key_[i] = key[i];
   }
 
@@ -63,7 +87,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   bool read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
                       uint8_t &resp_len, uint8_t max_polls = 80);
 
-  // ── DESFire operations (all fixed-size stack buffers) ──
+  // ── DESFire operations ──
   bool desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len,
                      uint8_t *response, uint8_t resp_cap,
                      uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
@@ -76,11 +100,23 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
                         const uint8_t *iv, uint8_t *out);
   void random_bytes_(uint8_t *buf, uint8_t len);
 
+  // ── Security helpers ──
+  static void secure_zero_(volatile uint8_t *buf, uint8_t len);
+
   // ── Publish helpers (only when value changes) ──
   void format_uid_(const uint8_t *uid_bytes, uint8_t uid_len, char *out);
   void publish_uid_(const char *uid_str);
   void publish_auth_(bool state);
   void publish_result_(const char *str);
+
+  // ── NFC task (ESP32 only) ──
+#ifdef USE_ESP32
+  static void nfc_task_(void *param);
+  void nfc_loop_();
+  TaskHandle_t nfc_task_handle_{nullptr};
+  SemaphoreHandle_t result_mutex_{nullptr};
+  NfcResult pending_result_{};
+#endif
 
   // ── Config ──
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
@@ -94,17 +130,18 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   text_sensor::TextSensor     *uid_sensor_{nullptr};
   binary_sensor::BinarySensor *auth_sensor_{nullptr};
 
-  // ── Publish-only-when-changed cache ──
+  // ─�� Publish-only-when-changed cache ──
   char     last_uid_[24]{};
-  char     last_result_[18]{};
+  char     last_result_[50]{};
   bool     last_auth_{false};
 
-  // ── Cooldown + UID dedup ──
+  // ── Cooldown + UID dedup (used inside nfc_loop_) ──
   uint32_t cooldown_until_{0};
   uint8_t  prev_uid_[7]{};
   uint8_t  prev_uid_len_{0};
   bool     card_present_{false};
   uint8_t  no_card_count_{0};
+  uint8_t  consecutive_fails_{0};
 };
 
 }  // namespace desfire_reader
