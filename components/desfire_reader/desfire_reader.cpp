@@ -417,8 +417,6 @@ bool DesfireReaderComponent::df_auth_aes_() {
   memcpy(enc_rnd_b, resp1, 16);
 
   // ── Step 2: Decrypt E_k(RndB) with CBC, IV = 0 ──
-  // CBC decrypt: plaintext = Dec_k(ciphertext) ^ IV
-  // First operation, so IV = 0 → plaintext = Dec_k(enc_rnd_b)
   uint8_t rnd_b[16];
   aes_dec_block_(app_rk_, enc_rnd_b, rnd_b);
 
