@@ -10,9 +10,9 @@
 namespace esphome {
 namespace desfire_reader {
 
-// ═══════════════════════════════════════════════════════════════
+// ═════════════���═════════════════════════════════════════════════
 //  Security helper: zero sensitive memory (not optimised away)
-// ════════════════════════════════��══════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
   for (uint8_t i = 0; i < len; i++)
@@ -20,7 +20,7 @@ void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Raw PN532 I2C frame protocol
+//  Raw PN532 I2C frame protocol — NON-BLOCKING
 // ═══════════════════════════════════════════════════════════════
 
 bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len) {
@@ -49,65 +49,104 @@ bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len)
   if (this->write(frame, total) != i2c::ERROR_OK)
     return false;
 
-  delay(2);
-
-  for (uint8_t retry = 0; retry < 15; retry++) {
-    uint8_t ack[7];
-    if (this->read(ack, 7) == i2c::ERROR_OK && ack[0] == 0x01) {
-      return (ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
-              ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00);
-    }
-    delay(3);
-  }
-  return false;
+  ack_received_ = false;
+  poll_attempts_ = 0;
+  state_entered_at_ = millis();
+  return true;
 }
 
-bool DesfireReaderComponent::read_response_(uint8_t command,
-                                            uint8_t *resp, uint8_t resp_cap,
-                                            uint8_t &resp_len,
-                                            uint8_t max_polls) {
+// Non-blocking: try to read ACK once. Returns true if ACK received OK.
+// Returns false if not ready yet or bad ACK.
+bool DesfireReaderComponent::try_read_ack_() {
+  uint8_t ack[7];
+  if (this->read(ack, 7) != i2c::ERROR_OK || ack[0] != 0x01)
+    return false;  // not ready yet
+
+  return (ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
+          ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00);
+}
+
+// Non-blocking: try to read response once. Returns true if response received OK.
+bool DesfireReaderComponent::try_read_response_(uint8_t command,
+                                                 uint8_t *resp, uint8_t resp_cap,
+                                                 uint8_t &resp_len) {
   resp_len = 0;
   uint8_t buf[PN532_BUF_SIZE];
 
-  for (uint8_t poll = 0; poll < max_polls; poll++) {
-    if (this->read(buf, sizeof(buf)) != i2c::ERROR_OK || buf[0] != 0x01) {
-      delay(3);
-      continue;
-    }
+  if (this->read(buf, sizeof(buf)) != i2c::ERROR_OK || buf[0] != 0x01)
+    return false;  // not ready
 
-    if (buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0xFF)
-      return false;
+  if (buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0xFF)
+    return false;
 
-    uint8_t frame_len = buf[4];
-    if ((uint8_t)(frame_len + buf[5]) != 0)
-      return false;
+  uint8_t frame_len = buf[4];
+  if ((uint8_t)(frame_len + buf[5]) != 0)
+    return false;
 
-    if (buf[6] != 0xD5 || buf[7] != (uint8_t)(command + 1))
-      return false;
+  if (buf[6] != 0xD5 || buf[7] != (uint8_t)(command + 1))
+    return false;
 
-    if (frame_len < 2)
-      return false;
-    uint8_t payload_len = frame_len - 2;
+  if (frame_len < 2)
+    return false;
+  uint8_t payload_len = frame_len - 2;
 
-    if ((uint16_t)(10 + payload_len) > sizeof(buf))
-      return false;
+  if ((uint16_t)(10 + payload_len) > sizeof(buf))
+    return false;
 
-    uint8_t dcs_sum = 0;
-    for (uint8_t i = 0; i < frame_len; i++)
-      dcs_sum += buf[6 + i];
-    dcs_sum += buf[6 + frame_len];
-    if (dcs_sum != 0)
-      return false;
+  uint8_t dcs_sum = 0;
+  for (uint8_t i = 0; i < frame_len; i++)
+    dcs_sum += buf[6 + i];
+  dcs_sum += buf[6 + frame_len];
+  if (dcs_sum != 0)
+    return false;
 
-    if (buf[7 + frame_len] != 0x00)
-      return false;
+  if (buf[7 + frame_len] != 0x00)
+    return false;
 
-    uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
-    memcpy(resp, buf + 8, copy_len);
-    resp_len = copy_len;
-    return true;
-  }
-  return false;
+  uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
+  memcpy(resp, buf + 8, copy_len);
+  resp_len = copy_len;
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DESFire APDU — split into send/receive
+// ═══════════════════════════════════════════════════════════════
+
+bool DesfireReaderComponent::send_desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len) {
+  uint8_t cmd[PN532_BUF_SIZE];
+  if ((uint16_t)(2 + apdu_len) > sizeof(cmd))
+    return false;
+  cmd[0] = PN532_CMD_IN_DATA_EXCHANGE;
+  cmd[1] = 0x01;
+  memcpy(cmd + 2, apdu, apdu_len);
+  return this->write_command_(cmd, 2 + apdu_len);
+}
+
+bool DesfireReaderComponent::read_desfire_apdu_(uint8_t *response, uint8_t resp_cap,
+                                                 uint8_t &resp_len, uint8_t &sw1,
+                                                 uint8_t &sw2) {
+  resp_len = 0;
+  uint8_t raw[PN532_BUF_SIZE];
+  uint8_t raw_len;
+
+  if (!this->try_read_response_(PN532_CMD_IN_DATA_EXCHANGE, raw, sizeof(raw), raw_len))
+    return false;
+
+  if (raw_len == 0 || raw[0] != 0x00)
+    return false;
+  if (raw_len < 3)
+    return false;
+
+  sw1 = raw[raw_len - 2];
+  sw2 = raw[raw_len - 1];
+
+  uint8_t payload_len = raw_len - 3;
+  uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
+  if (copy_len > 0)
+    memcpy(response, raw + 1, copy_len);
+  resp_len = copy_len;
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -158,7 +197,31 @@ void DesfireReaderComponent::publish_result_(const char *str) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Setup
+//  State machine helpers
+// ═══════════════════════════════════════════════════════════════
+
+void DesfireReaderComponent::handle_fail_() {
+  if (consecutive_fails_ < 255) consecutive_fails_++;
+  uint32_t delay_ms = COOLDOWN_FAIL_BASE_MS;
+  for (uint8_t i = 1; i < consecutive_fails_ && delay_ms < COOLDOWN_FAIL_MAX_MS; i++)
+    delay_ms = (delay_ms * 2 > COOLDOWN_FAIL_MAX_MS) ? COOLDOWN_FAIL_MAX_MS : delay_ms * 2;
+  ESP_LOGD(TAG, "Fail #%d — cooldown %lu ms", consecutive_fails_, (unsigned long)delay_ms);
+
+  publish_auth_(false);
+  reset_to_idle_(delay_ms);
+}
+
+void DesfireReaderComponent::reset_to_idle_(uint32_t cooldown_ms) {
+  state_ = NfcState::IDLE;
+  cooldown_until_ = millis() + cooldown_ms;
+  // Clear sensitive auth buffers
+  secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
+  secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
+  secure_zero_((volatile uint8_t *)token_, sizeof(token_));
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Setup — with timeout protection
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::setup() {
@@ -172,6 +235,8 @@ void DesfireReaderComponent::setup() {
   this->write(wakeup, sizeof(wakeup));
   delay(10);
 
+  // SAMConfiguration — this is the only place we use a short blocking wait
+  // during setup, which is acceptable since it runs once at boot.
   const uint8_t sam_cmd[] = {0x14, 0x01, 0x14, 0x00};
   if (!this->write_command_(sam_cmd, sizeof(sam_cmd))) {
     ESP_LOGE(TAG, "PN532 not responding — check I2C wiring (addr 0x%02X)",
@@ -179,610 +244,524 @@ void DesfireReaderComponent::setup() {
     this->mark_failed();
     return;
   }
-  uint8_t sam_resp[8];
-  uint8_t sam_len;
-  this->read_response_(0x14, sam_resp, sizeof(sam_resp), sam_len, 30);
 
+  // Brief blocking wait for SAM response only — with timeout
+  uint8_t sam_resp[8];
+  uint8_t sam_len = 0;
+  uint32_t start = millis();
+  bool sam_ok = false;
+
+  // Wait for ACK first (max 50ms)
+  while (millis() - start < 50) {
+    if (try_read_ack_()) {
+      sam_ok = true;
+      break;
+    }
+    delay(2);
+  }
+
+  if (sam_ok) {
+    // Now wait for response (max 100ms)
+    start = millis();
+    while (millis() - start < 100) {
+      if (try_read_response_(0x14, sam_resp, sizeof(sam_resp), sam_len))
+        break;
+      delay(3);
+    }
+  } else {
+    ESP_LOGE(TAG, "PN532 SAM ACK timeout — check wiring");
+    this->mark_failed();
+    return;
+  }
+
+  // RFConfiguration MaxRetries — also brief blocking at setup
   const uint8_t rf_cfg[] = {0x12, 0x05, 0xFF, 0x01, 0x02};
   if (this->write_command_(rf_cfg, sizeof(rf_cfg))) {
-    uint8_t rf_resp[4];
-    uint8_t rf_len;
-    if (this->read_response_(0x12, rf_resp, sizeof(rf_resp), rf_len, 30))
-      ESP_LOGCONFIG(TAG, "PN532 MaxRetries configured OK.");
-    else
-      ESP_LOGW(TAG, "PN532 RFConfiguration response failed — using defaults.");
+    start = millis();
+    bool ack_ok = false;
+    while (millis() - start < 50) {
+      if (try_read_ack_()) { ack_ok = true; break; }
+      delay(2);
+    }
+    if (ack_ok) {
+      uint8_t rf_resp[4];
+      uint8_t rf_len;
+      start = millis();
+      while (millis() - start < 100) {
+        if (try_read_response_(0x12, rf_resp, sizeof(rf_resp), rf_len)) {
+          ESP_LOGCONFIG(TAG, "PN532 MaxRetries configured OK.");
+          break;
+        }
+        delay(3);
+      }
+    } else {
+      ESP_LOGW(TAG, "PN532 RFConfiguration ACK failed — using defaults.");
+    }
   } else {
     ESP_LOGW(TAG, "PN532 RFConfiguration write failed — using defaults.");
   }
 
+  state_ = NfcState::IDLE;
+  cooldown_until_ = 0;
   ESP_LOGCONFIG(TAG, "PN532 initialized (MaxRetries=2).");
-
-#ifdef USE_ESP32
-  // Create mutex for passing results from NFC task → main loop
-  result_mutex_ = xSemaphoreCreateMutex();
-
-  // Spawn NFC polling task pinned to core 1
-  xTaskCreatePinnedToCore(
-      nfc_task_,           // task function
-      "nfc_poll",          // name
-      NFC_TASK_STACK,      // stack size
-      this,                // parameter
-      NFC_TASK_PRIORITY,   // priority (1 = just above idle)
-      &nfc_task_handle_,   // handle
-      NFC_TASK_CORE        // core 1
-  );
-  ESP_LOGCONFIG(TAG, "NFC task pinned to core %d (stack=%d, prio=%d)",
-                NFC_TASK_CORE, NFC_TASK_STACK, NFC_TASK_PRIORITY);
-#endif
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  NFC task — runs on core 1, does all blocking I2C/NFC work
-// ═══════════════════════════════════════════════════════════════
-
-#ifdef USE_ESP32
-
-void DesfireReaderComponent::nfc_task_(void *param) {
-  auto *self = static_cast<DesfireReaderComponent *>(param);
-  for (;;) {
-    self->nfc_loop_();
-    vTaskDelay(pdMS_TO_TICKS(NFC_POLL_INTERVAL_MS));
-  }
-}
-
-void DesfireReaderComponent::nfc_loop_() {
-  uint32_t now = millis();
-  if ((int32_t)(cooldown_until_ - now) > 0)
-    return;
-
-  const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
-  bool detected = false;
-
-  if (this->write_command_(detect_cmd, sizeof(detect_cmd))) {
-    uint8_t resp[48];
-    uint8_t resp_len;
-    if (this->read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp),
-                             resp_len, 20) &&
-        resp_len > 0 && resp[0] != 0) {
-      detected = true;
-      no_card_count_ = 0;
-
-      uint8_t uid_len = 0;
-      const uint8_t *uid_ptr = nullptr;
-      if (resp_len >= 7) {
-        uid_len = resp[5];
-        if (uid_len > 7) uid_len = 7;
-        if (resp_len >= (uint8_t)(6 + uid_len))
-          uid_ptr = resp + 6;
-        else
-          uid_len = 0;
-      }
-
-      // Same card still present — skip re-auth
-      if (uid_len > 0 && uid_len == prev_uid_len_ &&
-          memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
-        cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
-        return;
-      }
-
-      // New card
-      char uid_str[24] = {0};
-      if (uid_len > 0 && uid_ptr != nullptr) {
-        memcpy(prev_uid_, uid_ptr, uid_len);
-        prev_uid_len_ = uid_len;
-        format_uid_(uid_ptr, uid_len, uid_str);
-        ESP_LOGI(TAG, "UID: %s", uid_str);
-      }
-      card_present_ = true;
-
-      ESP_LOGI(TAG, "New card — starting DESFire workflow");
-
-      // Exponential backoff lambda
-      auto fail_cooldown = [this]() -> uint32_t {
-        if (consecutive_fails_ < 255) consecutive_fails_++;
-        uint32_t delay_ms = COOLDOWN_FAIL_BASE_MS;
-        for (uint8_t i = 1; i < consecutive_fails_ && delay_ms < COOLDOWN_FAIL_MAX_MS; i++)
-          delay_ms = (delay_ms * 2 > COOLDOWN_FAIL_MAX_MS) ? COOLDOWN_FAIL_MAX_MS : delay_ms * 2;
-        ESP_LOGD(TAG, "Fail #%d — cooldown %lu ms", consecutive_fails_, (unsigned long)delay_ms);
-        return delay_ms;
-      };
-
-      // ── SelectApp ──
-      if (!df_select_app_()) {
-        ESP_LOGE(TAG, "SelectApp FAILED — app %02X%02X%02X not on card?",
-                 app_id_[0], app_id_[1], app_id_[2]);
-        if (xSemaphoreTake(result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
-          pending_result_.has_update = true;
-          pending_result_.auth_ok = false;
-          pending_result_.uid[0] = '\0';
-          pending_result_.result[0] = '\0';
-          pending_result_.card_removed = false;
-          xSemaphoreGive(result_mutex_);
-        }
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      // ── AES Auth ──
-      if (!df_auth_aes_()) {
-        ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
-        if (xSemaphoreTake(result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
-          pending_result_.has_update = true;
-          pending_result_.auth_ok = false;
-          pending_result_.uid[0] = '\0';
-          pending_result_.result[0] = '\0';
-          pending_result_.card_removed = false;
-          xSemaphoreGive(result_mutex_);
-        }
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      // ── ReadFile ──
-      uint8_t raw[48];
-      uint8_t raw_len;
-      if (!df_read_file_(0x01, 0, raw, raw_len)) {
-        ESP_LOGE(TAG, "ReadFile FAILED");
-        if (xSemaphoreTake(result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
-          pending_result_.has_update = true;
-          pending_result_.auth_ok = false;
-          pending_result_.uid[0] = '\0';
-          pending_result_.result[0] = '\0';
-          pending_result_.card_removed = false;
-          xSemaphoreGive(result_mutex_);
-        }
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      ESP_LOGD(TAG, "ReadFile OK — %d bytes", raw_len);
-
-      uint8_t cipher_len = (raw_len / 16) * 16;
-
-      if (cipher_len == 0 || cipher_len > 48) {
-        ESP_LOGE(TAG, "Bad cipher length (%d from %d raw bytes)", cipher_len, raw_len);
-        if (xSemaphoreTake(result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
-          pending_result_.has_update = true;
-          pending_result_.auth_ok = false;
-          pending_result_.uid[0] = '\0';
-          pending_result_.result[0] = '\0';
-          pending_result_.card_removed = false;
-          xSemaphoreGive(result_mutex_);
-        }
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      if (raw_len != cipher_len) {
-        ESP_LOGD(TAG, "Stripped %d trailing bytes (CMAC)", raw_len - cipher_len);
-      }
-
-      uint8_t decrypted[48];
-      uint8_t zero_iv[16] = {0};
-      if (!aes_cbc_decrypt_(raw, cipher_len, zero_iv, decrypted)) {
-        ESP_LOGE(TAG, "AES decrypt FAILED");
-        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-        if (xSemaphoreTake(result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
-          pending_result_.has_update = true;
-          pending_result_.auth_ok = false;
-          pending_result_.uid[0] = '\0';
-          pending_result_.result[0] = '\0';
-          pending_result_.card_removed = false;
-          xSemaphoreGive(result_mutex_);
-        }
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      // Extract printable result
-      char result[49];
-      uint8_t rlen = 0;
-      for (uint8_t i = 0; i < cipher_len && i < 48 &&
-           decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
-        result[rlen++] = (char)decrypted[i];
-      result[rlen] = '\0';
-
-      secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-
-      ESP_LOGI(TAG, "Auth + read OK (%d bytes)", rlen);
-
-      // ── Push result to main loop via mutex ──
-      if (xSemaphoreTake(result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
-        pending_result_.has_update = true;
-        pending_result_.auth_ok = true;
-        strncpy(pending_result_.uid, uid_str, sizeof(pending_result_.uid) - 1);
-        pending_result_.uid[sizeof(pending_result_.uid) - 1] = '\0';
-        strncpy(pending_result_.result, result, sizeof(pending_result_.result) - 1);
-        pending_result_.result[sizeof(pending_result_.result) - 1] = '\0';
-        pending_result_.card_removed = false;
-        xSemaphoreGive(result_mutex_);
-      }
-
-      secure_zero_((volatile uint8_t *)result, sizeof(result));
-
-      consecutive_fails_ = 0;
-      cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
-      return;
-    }
-  }
-
-  // ── No card detected ──
-  if (!detected) {
-    if (no_card_count_ < 255) no_card_count_++;
-    if (no_card_count_ >= 3 && card_present_) {
-      card_present_ = false;
-      prev_uid_len_ = 0;
-      ESP_LOGD(TAG, "Card removed");
-      if (xSemaphoreTake(result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
-        pending_result_.has_update = true;
-        pending_result_.auth_ok = false;
-        pending_result_.uid[0] = '\0';
-        pending_result_.result[0] = '\0';
-        pending_result_.card_removed = true;
-        xSemaphoreGive(result_mutex_);
-      }
-    }
-  }
-}
-
-#endif  // USE_ESP32
-
-// ═══════════════════════════════════════════════════════════════
-//  Update — main loop (core 1 ESPHome loop) — just reads results
+//  Update — NON-BLOCKING state machine
+//  Each call does ONE small step, then returns to the main loop.
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
-#ifdef USE_ESP32
-  // Non-blocking: just check if the NFC task has produced a result
-  if (result_mutex_ == nullptr)
-    return;
-
-  NfcResult local;
-  local.has_update = false;
-
-  if (xSemaphoreTake(result_mutex_, 0) == pdTRUE) {
-    if (pending_result_.has_update) {
-      memcpy(&local, &pending_result_, sizeof(NfcResult));
-      pending_result_.has_update = false;
-    }
-    xSemaphoreGive(result_mutex_);
-  }
-
-  if (!local.has_update)
-    return;
-
-  if (local.card_removed) {
-    publish_auth_(false);
-    publish_result_("");
-    publish_uid_("");
-    return;
-  }
-
-  if (local.uid[0] != '\0')
-    publish_uid_(local.uid);
-
-  if (local.auth_ok) {
-    publish_auth_(true);
-    publish_result_(local.result);
-  } else {
-    publish_auth_(false);
-  }
-
-#else
-  // ── Non-ESP32 fallback: blocking inline (original behaviour) ──
   uint32_t now = millis();
-  if ((int32_t)(cooldown_until_ - now) > 0)
-    return;
 
-  const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
-  bool detected = false;
+  switch (state_) {
 
-  if (this->write_command_(detect_cmd, sizeof(detect_cmd))) {
-    uint8_t resp[48];
-    uint8_t resp_len;
-    if (this->read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp),
-                             resp_len, 20) &&
-        resp_len > 0 && resp[0] != 0) {
-      detected = true;
-      no_card_count_ = 0;
+  // ─────────────────────────────────────────────
+  case NfcState::IDLE: {
+    if ((int32_t)(cooldown_until_ - now) > 0)
+      return;  // still cooling down
 
-      uint8_t uid_len = 0;
-      const uint8_t *uid_ptr = nullptr;
-      if (resp_len >= 7) {
-        uid_len = resp[5];
-        if (uid_len > 7) uid_len = 7;
-        if (resp_len >= (uint8_t)(6 + uid_len))
-          uid_ptr = resp + 6;
-        else
-          uid_len = 0;
-      }
-
-      if (uid_len > 0 && uid_len == prev_uid_len_ &&
-          memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
-        cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
-        return;
-      }
-
-      if (uid_len > 0 && uid_ptr != nullptr) {
-        memcpy(prev_uid_, uid_ptr, uid_len);
-        prev_uid_len_ = uid_len;
-        char uid_str[24];
-        format_uid_(uid_ptr, uid_len, uid_str);
-        ESP_LOGI(TAG, "UID: %s", uid_str);
-        publish_uid_(uid_str);
-      }
-      card_present_ = true;
-      ESP_LOGI(TAG, "New card — starting DESFire workflow");
-
-      auto fail_cooldown = [this]() -> uint32_t {
-        if (consecutive_fails_ < 255) consecutive_fails_++;
-        uint32_t delay_ms = COOLDOWN_FAIL_BASE_MS;
-        for (uint8_t i = 1; i < consecutive_fails_ && delay_ms < COOLDOWN_FAIL_MAX_MS; i++)
-          delay_ms = (delay_ms * 2 > COOLDOWN_FAIL_MAX_MS) ? COOLDOWN_FAIL_MAX_MS : delay_ms * 2;
-        return delay_ms;
-      };
-
-      if (!df_select_app_()) {
-        publish_auth_(false);
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-      if (!df_auth_aes_()) {
-        publish_auth_(false);
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      uint8_t raw[48];
-      uint8_t raw_len;
-      if (!df_read_file_(0x01, 0, raw, raw_len)) {
-        publish_auth_(false);
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      uint8_t cipher_len = (raw_len / 16) * 16;
-      if (cipher_len == 0 || cipher_len > 48) {
-        publish_auth_(false);
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      uint8_t decrypted[48];
-      uint8_t zero_iv[16] = {0};
-      if (!aes_cbc_decrypt_(raw, cipher_len, zero_iv, decrypted)) {
-        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-        publish_auth_(false);
-        cooldown_until_ = millis() + fail_cooldown();
-        return;
-      }
-
-      char result[49];
-      uint8_t rlen = 0;
-      for (uint8_t i = 0; i < cipher_len && i < 48 &&
-           decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
-        result[rlen++] = (char)decrypted[i];
-      result[rlen] = '\0';
-
-      secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-      ESP_LOGI(TAG, "Auth + read OK (%d bytes)", rlen);
-      publish_auth_(true);
-      publish_result_(result);
-      secure_zero_((volatile uint8_t *)result, sizeof(result));
-      consecutive_fails_ = 0;
-      cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
+    // Send card detection command
+    const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
+    if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
+      reset_to_idle_(100);
       return;
     }
+    state_ = NfcState::DETECT_SEND;
+    state_entered_at_ = now;
+    return;
   }
 
-  if (!detected) {
-    if (no_card_count_ < 255) no_card_count_++;
-    if (no_card_count_ >= 3 && card_present_) {
-      card_present_ = false;
-      prev_uid_len_ = 0;
-      publish_auth_(false);
-      publish_result_("");
-      publish_uid_("");
-      ESP_LOGD(TAG, "Card removed");
+  // ─────────────────────────────────────────────
+  case NfcState::DETECT_SEND: {
+    // Wait for ACK
+    if (try_read_ack_()) {
+      state_ = NfcState::DETECT_READ;
+      state_entered_at_ = millis();
+      poll_attempts_ = 0;
+      return;
     }
+    // Timeout check
+    if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
+      ESP_LOGD(TAG, "Detect ACK timeout");
+      reset_to_idle_(100);
+    }
+    return;
   }
-#endif  // USE_ESP32
+
+  // ─────────────────────────────────────────────
+  case NfcState::DETECT_READ: {
+    uint8_t resp[48];
+    uint8_t resp_len;
+
+    if (try_read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp), resp_len)) {
+      if (resp_len > 0 && resp[0] != 0) {
+        // Card detected!
+        no_card_count_ = 0;
+
+        uint8_t uid_len = 0;
+        const uint8_t *uid_ptr = nullptr;
+        if (resp_len >= 7) {
+          uid_len = resp[5];
+          if (uid_len > 7) uid_len = 7;
+          if (resp_len >= (uint8_t)(6 + uid_len))
+            uid_ptr = resp + 6;
+          else
+            uid_len = 0;
+        }
+
+        // Same card still present — skip re-auth
+        if (uid_len > 0 && uid_len == prev_uid_len_ &&
+            memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
+          reset_to_idle_(COOLDOWN_SUCCESS_MS);
+          return;
+        }
+
+        // New card — store UID
+        current_uid_len_ = 0;
+        current_uid_str_[0] = '\0';
+        if (uid_len > 0 && uid_ptr != nullptr) {
+          memcpy(prev_uid_, uid_ptr, uid_len);
+          prev_uid_len_ = uid_len;
+          memcpy(current_uid_bytes_, uid_ptr, uid_len);
+          current_uid_len_ = uid_len;
+          format_uid_(uid_ptr, uid_len, current_uid_str_);
+          ESP_LOGI(TAG, "UID: %s", current_uid_str_);
+        }
+        card_present_ = true;
+        ESP_LOGI(TAG, "New card — starting DESFire workflow");
+
+        // Send SelectApplication
+        uint8_t apdu[] = {0x90, 0x5A, 0x00, 0x00, 0x03,
+                          app_id_[0], app_id_[1], app_id_[2], 0x00};
+        if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
+          ESP_LOGE(TAG, "SelectApp send failed");
+          handle_fail_();
+          return;
+        }
+        state_ = NfcState::SELECT_SEND;
+        state_entered_at_ = millis();
+        return;
+      }
+
+      // No card in response
+      if (no_card_count_ < 255) no_card_count_++;
+      if (no_card_count_ >= 3 && card_present_) {
+        card_present_ = false;
+        prev_uid_len_ = 0;
+        publish_auth_(false);
+        publish_result_("");
+        publish_uid_("");
+        ESP_LOGD(TAG, "Card removed");
+      }
+      reset_to_idle_(100);
+      return;
+    }
+
+    // Not ready yet — check timeout
+    poll_attempts_++;
+    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+      // No card
+      if (no_card_count_ < 255) no_card_count_++;
+      if (no_card_count_ >= 3 && card_present_) {
+        card_present_ = false;
+        prev_uid_len_ = 0;
+        publish_auth_(false);
+        publish_result_("");
+        publish_uid_("");
+        ESP_LOGD(TAG, "Card removed (timeout)");
+      }
+      reset_to_idle_(100);
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::SELECT_SEND: {
+    if (!ack_received_) {
+      if (try_read_ack_()) {
+        ack_received_ = true;
+        poll_attempts_ = 0;
+        state_entered_at_ = millis();
+        state_ = NfcState::SELECT_READ;
+        return;
+      }
+      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
+        ESP_LOGE(TAG, "SelectApp ACK timeout");
+        handle_fail_();
+      }
+      return;
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::SELECT_READ: {
+    uint8_t resp[8];
+    uint8_t resp_len, sw1, sw2;
+
+    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
+      if (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK) {
+        ESP_LOGD(TAG, "SelectApp OK");
+        // Send AES auth phase 1
+        uint8_t apdu1[] = {0x90, 0xAA, 0x00, 0x00, 0x01, 0x00, 0x00};
+        if (!send_desfire_apdu_(apdu1, sizeof(apdu1))) {
+          ESP_LOGE(TAG, "Auth1 send failed");
+          handle_fail_();
+          return;
+        }
+        state_ = NfcState::AUTH1_SEND;
+        state_entered_at_ = millis();
+        return;
+      }
+      ESP_LOGE(TAG, "SelectApp FAILED — app %02X%02X%02X not on card?",
+               app_id_[0], app_id_[1], app_id_[2]);
+      handle_fail_();
+      return;
+    }
+
+    poll_attempts_++;
+    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+      ESP_LOGE(TAG, "SelectApp read timeout");
+      handle_fail_();
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::AUTH1_SEND: {
+    if (!ack_received_) {
+      if (try_read_ack_()) {
+        ack_received_ = true;
+        poll_attempts_ = 0;
+        state_entered_at_ = millis();
+        state_ = NfcState::AUTH1_READ;
+        return;
+      }
+      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
+        ESP_LOGE(TAG, "Auth1 ACK timeout");
+        handle_fail_();
+      }
+      return;
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::AUTH1_READ: {
+    uint8_t resp1[32];
+    uint8_t resp1_len, sw1, sw2;
+
+    if (read_desfire_apdu_(resp1, sizeof(resp1), resp1_len, sw1, sw2)) {
+      if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16) {
+        ESP_LOGE(TAG, "Auth1 unexpected response (sw2=0x%02X, len=%d)", sw2, resp1_len);
+        handle_fail_();
+        return;
+      }
+
+      // Compute auth phase 2 token
+      memcpy(enc_rnd_b_, resp1, 16);
+
+      uint8_t rnd_b[16];
+      aes_dec_block_(app_rk_, enc_rnd_b_, rnd_b);
+
+      random_bytes_(rnd_a_, 16);
+
+      uint8_t rnd_b_rot[16];
+      memcpy(rnd_b_rot, rnd_b + 1, 15);
+      rnd_b_rot[15] = rnd_b[0];
+
+      uint8_t xor_buf[16];
+      for (uint8_t i = 0; i < 16; i++)
+        xor_buf[i] = rnd_a_[i] ^ enc_rnd_b_[i];
+      aes_enc_block_(app_rk_, xor_buf, token_);
+
+      for (uint8_t i = 0; i < 16; i++)
+        xor_buf[i] = rnd_b_rot[i] ^ token_[i];
+      aes_enc_block_(app_rk_, xor_buf, token_ + 16);
+
+      // Send auth phase 2
+      uint8_t apdu2[38];
+      apdu2[0] = 0x90;
+      apdu2[1] = 0xAF;
+      apdu2[2] = 0x00;
+      apdu2[3] = 0x00;
+      apdu2[4] = 0x20;
+      memcpy(apdu2 + 5, token_, 32);
+      apdu2[37] = 0x00;
+
+      secure_zero_((volatile uint8_t *)rnd_b, 16);
+      secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
+      secure_zero_((volatile uint8_t *)xor_buf, 16);
+
+      if (!send_desfire_apdu_(apdu2, sizeof(apdu2))) {
+        ESP_LOGE(TAG, "Auth2 send failed");
+        handle_fail_();
+        return;
+      }
+      state_ = NfcState::AUTH2_SEND;
+      state_entered_at_ = millis();
+      return;
+    }
+
+    poll_attempts_++;
+    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+      ESP_LOGE(TAG, "Auth1 read timeout");
+      handle_fail_();
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::AUTH2_SEND: {
+    if (!ack_received_) {
+      if (try_read_ack_()) {
+        ack_received_ = true;
+        poll_attempts_ = 0;
+        state_entered_at_ = millis();
+        state_ = NfcState::AUTH2_READ;
+        return;
+      }
+      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
+        ESP_LOGE(TAG, "Auth2 ACK timeout");
+        handle_fail_();
+      }
+      return;
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::AUTH2_READ: {
+    uint8_t resp2[32];
+    uint8_t resp2_len, sw1, sw2;
+
+    if (read_desfire_apdu_(resp2, sizeof(resp2), resp2_len, sw1, sw2)) {
+      if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
+        ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
+        handle_fail_();
+        return;
+      }
+      if (resp2_len != 16) {
+        ESP_LOGE(TAG, "Auth response wrong length (%d, expected 16)", resp2_len);
+        handle_fail_();
+        return;
+      }
+
+      // Verify mutual auth
+      uint8_t rnd_a_expected[16];
+      memcpy(rnd_a_expected, rnd_a_ + 1, 15);
+      rnd_a_expected[15] = rnd_a_[0];
+
+      uint8_t dec_tmp[16];
+      aes_dec_block_(app_rk_, resp2, dec_tmp);
+      uint8_t rnd_a_received[16];
+      for (uint8_t i = 0; i < 16; i++)
+        rnd_a_received[i] = dec_tmp[i] ^ token_[16 + i];
+
+      uint8_t diff = 0;
+      for (uint8_t i = 0; i < 16; i++)
+        diff |= rnd_a_received[i] ^ rnd_a_expected[i];
+
+      secure_zero_((volatile uint8_t *)rnd_a_expected, 16);
+      secure_zero_((volatile uint8_t *)rnd_a_received, 16);
+      secure_zero_((volatile uint8_t *)dec_tmp, 16);
+
+      if (diff != 0) {
+        ESP_LOGE(TAG, "Mutual auth FAILED — RndA' mismatch");
+        handle_fail_();
+        return;
+      }
+
+      ESP_LOGI(TAG, "Mutual AES auth verified — card is genuine");
+
+      // Send ReadFile
+      uint8_t apdu[] = {
+          0x90, 0xBD, 0x00, 0x00, 0x07, 0x01,
+          0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00,
+          0x00};
+      if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
+        ESP_LOGE(TAG, "ReadFile send failed");
+        handle_fail_();
+        return;
+      }
+      state_ = NfcState::READ_SEND;
+      state_entered_at_ = millis();
+      return;
+    }
+
+    poll_attempts_++;
+    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+      ESP_LOGE(TAG, "Auth2 read timeout");
+      handle_fail_();
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::READ_SEND: {
+    if (!ack_received_) {
+      if (try_read_ack_()) {
+        ack_received_ = true;
+        poll_attempts_ = 0;
+        state_entered_at_ = millis();
+        state_ = NfcState::READ_READ;
+        return;
+      }
+      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
+        ESP_LOGE(TAG, "ReadFile ACK timeout");
+        handle_fail_();
+      }
+      return;
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::READ_READ: {
+    uint8_t resp[48];
+    uint8_t resp_len, sw1, sw2;
+
+    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
+      if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
+        ESP_LOGE(TAG, "ReadFile FAILED (sw1=0x%02X sw2=0x%02X)", sw1, sw2);
+        handle_fail_();
+        return;
+      }
+
+      memcpy(raw_file_, resp, resp_len);
+      raw_file_len_ = resp_len;
+      state_ = NfcState::PUBLISH;
+      return;
+    }
+
+    poll_attempts_++;
+    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+      ESP_LOGE(TAG, "ReadFile read timeout");
+      handle_fail_();
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::PUBLISH: {
+    ESP_LOGD(TAG, "ReadFile OK — %d bytes", raw_file_len_);
+
+    uint8_t cipher_len = (raw_file_len_ / 16) * 16;
+
+    if (cipher_len == 0 || cipher_len > 48) {
+      ESP_LOGE(TAG, "Bad cipher length (%d from %d raw bytes)", cipher_len, raw_file_len_);
+      handle_fail_();
+      return;
+    }
+
+    if (raw_file_len_ != cipher_len) {
+      ESP_LOGD(TAG, "Stripped %d trailing bytes (CMAC)", raw_file_len_ - cipher_len);
+    }
+
+    uint8_t decrypted[48];
+    uint8_t zero_iv[16] = {0};
+    if (!aes_cbc_decrypt_(raw_file_, cipher_len, zero_iv, decrypted)) {
+      ESP_LOGE(TAG, "AES decrypt FAILED");
+      secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+      handle_fail_();
+      return;
+    }
+
+    // Extract printable result
+    char result[49];
+    uint8_t rlen = 0;
+    for (uint8_t i = 0; i < cipher_len && i < 48 &&
+         decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
+      result[rlen++] = (char)decrypted[i];
+    result[rlen] = '\0';
+
+    secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+
+    ESP_LOGI(TAG, "Auth + read OK (%d bytes)", rlen);
+
+    // Publish
+    if (current_uid_str_[0] != '\0')
+      publish_uid_(current_uid_str_);
+    publish_auth_(true);
+    publish_result_(result);
+
+    secure_zero_((volatile uint8_t *)result, sizeof(result));
+
+    consecutive_fails_ = 0;
+    reset_to_idle_(COOLDOWN_SUCCESS_MS);
+    return;
+  }
+
+  }  // end switch
 }
 
 void DesfireReaderComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "DESFire Reader:");
   ESP_LOGCONFIG(TAG, "  App ID: %02X:%02X:%02X", app_id_[0], app_id_[1], app_id_[2]);
-#ifdef USE_ESP32
-  ESP_LOGCONFIG(TAG, "  NFC task: core %d, stack %d, prio %d",
-                NFC_TASK_CORE, NFC_TASK_STACK, NFC_TASK_PRIORITY);
-#endif
+  ESP_LOGCONFIG(TAG, "  Mode: non-blocking state machine");
   LOG_I2C_DEVICE(this);
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  DESFire APDU via PN532 InDataExchange
-// ═══════════════════════════════════════════════════════════════
-
-bool DesfireReaderComponent::desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len,
-                                           uint8_t *response, uint8_t resp_cap,
-                                           uint8_t &resp_len, uint8_t &sw1,
-                                           uint8_t &sw2) {
-  resp_len = 0;
-  uint8_t cmd[PN532_BUF_SIZE];
-  if ((uint16_t)(2 + apdu_len) > sizeof(cmd))
-    return false;
-  cmd[0] = PN532_CMD_IN_DATA_EXCHANGE;
-  cmd[1] = 0x01;
-  memcpy(cmd + 2, apdu, apdu_len);
-
-  if (!this->write_command_(cmd, 2 + apdu_len))
-    return false;
-
-  uint8_t raw[PN532_BUF_SIZE];
-  uint8_t raw_len;
-  if (!this->read_response_(PN532_CMD_IN_DATA_EXCHANGE, raw, sizeof(raw),
-                            raw_len, 80))
-    return false;
-
-  if (raw_len == 0 || raw[0] != 0x00)
-    return false;
-  if (raw_len < 3)
-    return false;
-
-  sw1 = raw[raw_len - 2];
-  sw2 = raw[raw_len - 1];
-
-  uint8_t payload_len = raw_len - 3;
-  uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
-  if (copy_len > 0)
-    memcpy(response, raw + 1, copy_len);
-  resp_len = copy_len;
-  return true;
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  DESFire Operations
-// ═══════════════════════════════════════════════════════════════
-
-bool DesfireReaderComponent::df_select_app_() {
-  uint8_t apdu[] = {0x90, 0x5A, 0x00, 0x00, 0x03,
-                    app_id_[0], app_id_[1], app_id_[2], 0x00};
-  uint8_t resp[8];
-  uint8_t resp_len, sw1, sw2;
-  if (!desfire_apdu_(apdu, sizeof(apdu), resp, sizeof(resp), resp_len, sw1, sw2))
-    return false;
-  return sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK;
-}
-
-bool DesfireReaderComponent::df_auth_aes_() {
-  uint8_t apdu1[] = {0x90, 0xAA, 0x00, 0x00, 0x01, 0x00, 0x00};
-  uint8_t resp1[32];
-  uint8_t resp1_len, sw1, sw2;
-
-  if (!desfire_apdu_(apdu1, sizeof(apdu1), resp1, sizeof(resp1), resp1_len, sw1, sw2))
-    return false;
-  if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16)
-    return false;
-
-  uint8_t enc_rnd_b[16];
-  memcpy(enc_rnd_b, resp1, 16);
-
-  uint8_t rnd_b[16];
-  aes_dec_block_(app_rk_, enc_rnd_b, rnd_b);
-
-  uint8_t rnd_a[16];
-  random_bytes_(rnd_a, 16);
-
-  uint8_t rnd_b_rot[16];
-  memcpy(rnd_b_rot, rnd_b + 1, 15);
-  rnd_b_rot[15] = rnd_b[0];
-
-  uint8_t token[32];
-  uint8_t xor_buf[16];
-
-  for (uint8_t i = 0; i < 16; i++)
-    xor_buf[i] = rnd_a[i] ^ enc_rnd_b[i];
-  aes_enc_block_(app_rk_, xor_buf, token);
-
-  for (uint8_t i = 0; i < 16; i++)
-    xor_buf[i] = rnd_b_rot[i] ^ token[i];
-  aes_enc_block_(app_rk_, xor_buf, token + 16);
-
-  uint8_t apdu2[38];
-  apdu2[0] = 0x90;
-  apdu2[1] = 0xAF;
-  apdu2[2] = 0x00;
-  apdu2[3] = 0x00;
-  apdu2[4] = 0x20;
-  memcpy(apdu2 + 5, token, 32);
-  apdu2[37] = 0x00;
-
-  uint8_t resp2[32];
-  uint8_t resp2_len;
-  if (!desfire_apdu_(apdu2, sizeof(apdu2), resp2, sizeof(resp2), resp2_len, sw1, sw2)) {
-    secure_zero_((volatile uint8_t *)rnd_a, 16);
-    secure_zero_((volatile uint8_t *)rnd_b, 16);
-    secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
-    secure_zero_((volatile uint8_t *)token, 32);
-    secure_zero_((volatile uint8_t *)xor_buf, 16);
-    secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
-    return false;
-  }
-  if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
-    secure_zero_((volatile uint8_t *)rnd_a, 16);
-    secure_zero_((volatile uint8_t *)rnd_b, 16);
-    secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
-    secure_zero_((volatile uint8_t *)token, 32);
-    secure_zero_((volatile uint8_t *)xor_buf, 16);
-    secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
-    return false;
-  }
-
-  if (resp2_len != 16) {
-    ESP_LOGE(TAG, "Auth response wrong length (%d, expected 16)", resp2_len);
-    secure_zero_((volatile uint8_t *)rnd_a, 16);
-    secure_zero_((volatile uint8_t *)rnd_b, 16);
-    secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
-    secure_zero_((volatile uint8_t *)token, 32);
-    secure_zero_((volatile uint8_t *)xor_buf, 16);
-    secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
-    return false;
-  }
-
-  uint8_t rnd_a_expected[16];
-  memcpy(rnd_a_expected, rnd_a + 1, 15);
-  rnd_a_expected[15] = rnd_a[0];
-
-  uint8_t dec_tmp[16];
-  aes_dec_block_(app_rk_, resp2, dec_tmp);
-  uint8_t rnd_a_received[16];
-  for (uint8_t i = 0; i < 16; i++)
-    rnd_a_received[i] = dec_tmp[i] ^ token[16 + i];
-
-  uint8_t diff = 0;
-  for (uint8_t i = 0; i < 16; i++)
-    diff |= rnd_a_received[i] ^ rnd_a_expected[i];
-
-  bool ok = (diff == 0);
-
-  if (ok) {
-    ESP_LOGI(TAG, "Mutual AES auth verified — card is genuine");
-  } else {
-    ESP_LOGE(TAG, "Mutual auth FAILED — RndA' mismatch");
-  }
-
-  secure_zero_((volatile uint8_t *)rnd_a, 16);
-  secure_zero_((volatile uint8_t *)rnd_b, 16);
-  secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
-  secure_zero_((volatile uint8_t *)rnd_a_expected, 16);
-  secure_zero_((volatile uint8_t *)rnd_a_received, 16);
-  secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
-  secure_zero_((volatile uint8_t *)token, 32);
-  secure_zero_((volatile uint8_t *)xor_buf, 16);
-  secure_zero_((volatile uint8_t *)dec_tmp, 16);
-
-  return ok;
-}
-
-bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
-                                           uint8_t *out, uint8_t &out_len) {
-  uint8_t apdu[] = {
-      0x90, 0xBD, 0x00, 0x00, 0x07, file_id,
-      0x00, 0x00, 0x00,
-      length, 0x00, 0x00,
-      0x00};
-  uint8_t resp[48];
-  uint8_t resp_len, sw1, sw2;
-  if (!desfire_apdu_(apdu, sizeof(apdu), resp, sizeof(resp), resp_len, sw1, sw2))
-    return false;
-  if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
-    return false;
-  uint8_t copy_len = resp_len;
-  if (length > 0 && resp_len > length)
-    copy_len = length;
-  memcpy(out, resp, copy_len);
-  out_len = copy_len;
-  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════

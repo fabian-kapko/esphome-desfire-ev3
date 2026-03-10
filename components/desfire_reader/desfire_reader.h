@@ -7,12 +7,6 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include <string.h>
 
-#ifdef USE_ESP32
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/semphr.h>
-#endif
-
 namespace esphome {
 namespace desfire_reader {
 
@@ -31,24 +25,25 @@ static const uint16_t COOLDOWN_SUCCESS_MS   = 500;
 static const uint16_t COOLDOWN_FAIL_BASE_MS = 200;
 static const uint32_t COOLDOWN_FAIL_MAX_MS  = 30000;
 
-// NFC task config
-static const uint8_t  NFC_TASK_CORE       = 1;     // core 1 — keeps core 0 free for WiFi
-static const uint16_t NFC_TASK_STACK      = 4096;
-static const uint8_t  NFC_TASK_PRIORITY   = 1;     // just above idle
-static const uint16_t NFC_POLL_INTERVAL_MS = 100;   // how often the task polls for cards
-
 // Forward declarations of standalone AES helpers (defined in .cpp)
 void aes_key_exp_(const uint8_t *key, uint8_t *rk);
 void aes_enc_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
 void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
 
-// ── Data passed from NFC task → main loop ──
-struct NfcResult {
-  bool     has_update;       // true when task produced new data
-  bool     auth_ok;
-  char     uid[24];
-  char     result[50];
-  bool     card_removed;
+// ── State machine states ──
+enum class NfcState : uint8_t {
+  IDLE,              // waiting for cooldown
+  DETECT_SEND,       // send InListPassiveTarget
+  DETECT_READ,       // read detection response
+  SELECT_SEND,       // send SelectApplication
+  SELECT_READ,       // read SelectApplication response
+  AUTH1_SEND,        // send auth phase 1
+  AUTH1_READ,        // read auth phase 1 response
+  AUTH2_SEND,        // send auth phase 2
+  AUTH2_READ,        // read auth phase 2 response
+  READ_SEND,         // send ReadData
+  READ_READ,         // read ReadData response
+  PUBLISH,           // decrypt and publish results
 };
 
 class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
@@ -82,19 +77,16 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_uid_sensor(text_sensor::TextSensor *s)       { uid_sensor_ = s; }
 
  protected:
-  // ── PN532 I2C frame layer ──
+  // ── PN532 I2C frame layer (non-blocking) ──
   bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
-  bool read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
-                      uint8_t &resp_len, uint8_t max_polls = 80);
+  bool try_read_ack_();    // non-blocking: returns true if ACK received, false if not ready
+  bool try_read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
+                          uint8_t &resp_len);  // non-blocking single attempt
 
-  // ── DESFire operations ──
-  bool desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len,
-                     uint8_t *response, uint8_t resp_cap,
-                     uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
-  bool df_select_app_();
-  bool df_auth_aes_();
-  bool df_read_file_(uint8_t file_id, uint8_t length,
-                     uint8_t *out, uint8_t &out_len);
+  // ── DESFire operations (send/receive split) ──
+  bool send_desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len);
+  bool read_desfire_apdu_(uint8_t *response, uint8_t resp_cap,
+                          uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
 
   bool aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
                         const uint8_t *iv, uint8_t *out);
@@ -109,14 +101,9 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void publish_auth_(bool state);
   void publish_result_(const char *str);
 
-  // ── NFC task (ESP32 only) ──
-#ifdef USE_ESP32
-  static void nfc_task_(void *param);
-  void nfc_loop_();
-  TaskHandle_t nfc_task_handle_{nullptr};
-  SemaphoreHandle_t result_mutex_{nullptr};
-  NfcResult pending_result_{};
-#endif
+  // ── State machine helpers ──
+  void handle_fail_();
+  void reset_to_idle_(uint32_t cooldown_ms);
 
   // ── Config ──
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
@@ -130,18 +117,42 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   text_sensor::TextSensor     *uid_sensor_{nullptr};
   binary_sensor::BinarySensor *auth_sensor_{nullptr};
 
-  // ─�� Publish-only-when-changed cache ──
+  // ── Publish-only-when-changed cache ──
   char     last_uid_[24]{};
   char     last_result_[50]{};
   bool     last_auth_{false};
 
-  // ── Cooldown + UID dedup (used inside nfc_loop_) ──
+  // ── State machine ──
+  NfcState state_{NfcState::IDLE};
   uint32_t cooldown_until_{0};
+  uint32_t state_entered_at_{0};     // millis() when we entered current state
+  uint8_t  poll_attempts_{0};        // retry counter for read states
+  bool     ack_received_{false};     // whether ACK has been received for current command
+
+  // ── Card tracking ──
   uint8_t  prev_uid_[7]{};
   uint8_t  prev_uid_len_{0};
   bool     card_present_{false};
   uint8_t  no_card_count_{0};
   uint8_t  consecutive_fails_{0};
+
+  // ── Auth state carried between states ──
+  char     current_uid_str_[24]{};
+  uint8_t  current_uid_bytes_[7]{};
+  uint8_t  current_uid_len_{0};
+
+  // Auth handshake buffers (persisted across update() calls)
+  uint8_t  enc_rnd_b_[16]{};
+  uint8_t  rnd_a_[16]{};
+  uint8_t  token_[32]{};
+
+  // Raw file data buffer
+  uint8_t  raw_file_[48]{};
+  uint8_t  raw_file_len_{0};
+
+  // ── Timeouts ──
+  static const uint16_t READ_TIMEOUT_MS  = 300;   // max time to wait for a response
+  static const uint8_t  MAX_READ_POLLS   = 80;    // max poll attempts per read
 };
 
 }  // namespace desfire_reader
