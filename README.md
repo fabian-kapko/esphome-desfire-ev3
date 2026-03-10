@@ -17,7 +17,7 @@ An ESPHome external component that reads and authenticates **MIFARE DESFire EV3*
 
 | Component | Notes |
 |-----------|-------|
-| ESP8266 / ESP32 | Any ESPHome-supported board |
+| ESP32 | Any ESPHome-supported board with at least 512kb of ram|
 | PN532 NFC module | Connected via I2C (default address `0x24`) |
 
 Wire the PN532 to the ESP's I2C bus (SDA/SCL) and set its mode switches to **I2C**.
