@@ -265,32 +265,30 @@ void DesfireReaderComponent::update() {
       }
       yield();
 
+      // ── Read file (length=0 means "read entire file" in DESFire) ──
       uint8_t raw[48];
       uint8_t raw_len;
-      if (!df_read_file_(0x01, 32, raw, raw_len)) {
+      if (!df_read_file_(0x01, 0, raw, raw_len)) {
         ESP_LOGE(TAG, "ReadFile FAILED");
         publish_auth_(false);
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
 
-      uint8_t decrypted[16];
-      bool decrypt_ok = false;
+      ESP_LOGD(TAG, "ReadFile OK — %d bytes", raw_len);
 
-      if (raw_len >= 32) {
-        decrypt_ok = aes_cbc_decrypt_(raw + 16, 16, raw, decrypted);
-      } else if (raw_len >= 16) {
-        ESP_LOGW(TAG, "Legacy 16-byte file (zero IV) — consider re-provisioning card");
-        uint8_t zero_iv[16] = {0};
-        decrypt_ok = aes_cbc_decrypt_(raw, 16, zero_iv, decrypted);
-      } else {
-        ESP_LOGE(TAG, "Data too short (%d)", raw_len);
+      // The file contains AES-CBC encrypted data (IV=0, encrypted by provisioner).
+      // Decrypt the entire contents with data_key.
+      if (raw_len == 0 || raw_len % 16 != 0 || raw_len > 48) {
+        ESP_LOGE(TAG, "Bad file length (%d)", raw_len);
         publish_auth_(false);
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
 
-      if (!decrypt_ok) {
+      uint8_t decrypted[48];
+      uint8_t zero_iv[16] = {0};
+      if (!aes_cbc_decrypt_(raw, raw_len, zero_iv, decrypted)) {
         ESP_LOGE(TAG, "AES decrypt FAILED");
         publish_auth_(false);
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
@@ -299,7 +297,8 @@ void DesfireReaderComponent::update() {
 
       char result[17];
       uint8_t rlen = 0;
-      for (uint8_t i = 0; i < 16 && decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
+      for (uint8_t i = 0; i < raw_len && i < 16 &&
+           decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
         result[rlen++] = (char)decrypted[i];
       result[rlen] = '\0';
 
@@ -373,7 +372,7 @@ bool DesfireReaderComponent::desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len
 
 // ═══════════════════════════════════════════════════════════════
 //  DESFire Operations
-// ═════════════════════════════════════════════════════���═════════
+// ═══════════════════════════════════════════════════════════════
 
 bool DesfireReaderComponent::df_select_app_() {
   uint8_t apdu[] = {0x90, 0x5A, 0x00, 0x00, 0x03,
@@ -413,12 +412,9 @@ bool DesfireReaderComponent::df_auth_aes_() {
 
   // ── Step 2: Decrypt E_k(RndB) with CBC, IV = 0 ──
   // CBC decrypt: plaintext = Dec_k(ciphertext) ^ IV
-  // First operation, so IV = 0 → plaintext = Dec_k(enc_rnd_b) ^ 0 = Dec_k(enc_rnd_b)
-  // (Same result as raw decrypt for the first block)
+  // First operation, so IV = 0 → plaintext = Dec_k(enc_rnd_b)
   uint8_t rnd_b[16];
   aes_dec_block_(app_rk_, enc_rnd_b, rnd_b);
-  // After this decrypt, the receive-direction IV advances to enc_rnd_b.
-  // The send-direction IV also advances to enc_rnd_b (last received ciphertext).
 
   // Generate RndA
   uint8_t rnd_a[16];
@@ -471,7 +467,6 @@ bool DesfireReaderComponent::df_auth_aes_() {
   rnd_a_expected[15] = rnd_a[0];
 
   // ── Step 4: Decrypt E_k(RndA') with CBC, IV = token[16:31] ──
-  // The last ciphertext block we sent was token[16:31], so that's the IV.
   uint8_t dec_tmp[16];
   aes_dec_block_(app_rk_, resp2, dec_tmp);
   uint8_t rnd_a_received[16];
@@ -505,6 +500,7 @@ bool DesfireReaderComponent::df_auth_aes_() {
 
 bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
                                            uint8_t *out, uint8_t &out_len) {
+  // length=0 means "read entire file" in DESFire
   uint8_t apdu[] = {
       0x90, 0xBD, 0x00, 0x00, 0x07, file_id,
       0x00, 0x00, 0x00,
@@ -516,7 +512,9 @@ bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
     return false;
   if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
     return false;
-  uint8_t copy_len = (resp_len > length) ? length : resp_len;
+  uint8_t copy_len = resp_len;
+  if (length > 0 && resp_len > length)
+    copy_len = length;
   memcpy(out, resp, copy_len);
   out_len = copy_len;
   return true;
