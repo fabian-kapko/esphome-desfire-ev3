@@ -91,7 +91,7 @@ i2c:
   sda: GPIO21
   scl: GPIO22
   scan: true
-  frequency: 100kHz
+  frequency: 400kHz
 
 external_components:
   - source:
@@ -102,7 +102,7 @@ external_components:
 desfire_reader:
   id: my_reader
   address: 0x24
-  update_interval: 500ms
+  update_interval: 50ms
 
   app_id: "A1:B2:C3"
   app_key: "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
@@ -133,7 +133,7 @@ i2c:
   sda: GPIO21
   scl: GPIO22
   scan: true
-  frequency: 100kHz
+  frequency: 400kHz
 
 external_components:
   - source:
@@ -151,7 +151,7 @@ switch:
 desfire_reader:
   id: nfc_reader
   address: 0x24
-  update_interval: 500ms
+  update_interval: 50ms
 
   app_id: "A1:B2:C3"
   app_key: "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
