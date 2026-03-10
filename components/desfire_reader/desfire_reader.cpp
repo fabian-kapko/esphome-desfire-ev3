@@ -1,235 +1,159 @@
-#include "desfire_reader.h"
-#include "esp_system.h"
+#include "desfire_reader_secure.h"
 
-namespace esphome {
-namespace desfire_reader {
+#include <string.h>
 
-static const char *TAG = "desfire_reader";
-
-void DesfireReader::setup() {
-  memset(iv_, 0, 16);
+static void xor_block(uint8_t *dst, const uint8_t *src, size_t len)
+{
+  for (size_t i = 0; i < len; i++)
+    dst[i] ^= src[i];
 }
 
-void DesfireReader::set_app_key(const std::vector<uint8_t> &key) {
-  memcpy(app_key_, key.data(), 16);
+void DesfireReader::rotate_left_(uint8_t *data, size_t len)
+{
+  uint8_t first = data[0];
+  for (size_t i = 0; i < len - 1; i++)
+    data[i] = data[i + 1];
+  data[len - 1] = first;
 }
 
-void DesfireReader::loop() {
+bool DesfireReader::authenticate_aes(uint8_t key_no, const uint8_t *key)
+{
+  std::vector<uint8_t> rx;
 
-  uint8_t uid[10];
-  uint8_t uid_len;
-
-  if (!pn532_->read_passive_target_id(PN532_MIFARE_ISO14443A, uid, &uid_len))
-    return;
-
-  std::string uid_str;
-  for (int i = 0; i < uid_len; i++) {
-    char buf[4];
-    sprintf(buf, "%02X", uid[i]);
-    uid_str += buf;
-  }
-
-  if (uid_sensor_) uid_sensor_->publish_state(uid_str);
-
-  if (!select_application_()) {
-    if (auth_sensor_) auth_sensor_->publish_state(false);
-    return;
-  }
-
-  if (!authenticate_()) {
-    if (auth_sensor_) auth_sensor_->publish_state(false);
-    return;
-  }
-
-  std::vector<uint8_t> file_data;
-
-  if (!read_file_secure_(file_data)) {
-    if (auth_sensor_) auth_sensor_->publish_state(false);
-    return;
-  }
-
-  std::string parsed;
-
-  if (!validate_payload_(file_data, parsed)) {
-    if (auth_sensor_) auth_sensor_->publish_state(false);
-    return;
-  }
-
-  if (result_sensor_) result_sensor_->publish_state(parsed);
-
-  if (auth_sensor_) auth_sensor_->publish_state(true);
-}
-
-bool DesfireReader::select_application_() {
-
-  uint8_t cmd[4];
-
-  cmd[0] = 0x5A;
-  cmd[1] = (app_id_) & 0xFF;
-  cmd[2] = (app_id_ >> 8) & 0xFF;
-  cmd[3] = (app_id_ >> 16) & 0xFF;
-
-  return pn532_->in_data_exchange(cmd, 4, nullptr, nullptr);
-}
-
-bool DesfireReader::authenticate_() {
-
-  uint8_t rndA[16];
-  esp_fill_random(rndA, 16);
-
-  uint8_t cmd[2] = {0xAA, 0x00};
-
-  uint8_t resp[32];
-  uint8_t len;
-
-  if (!pn532_->in_data_exchange(cmd, 2, resp, &len))
+  if (!desfire_apdu_(0xAA, {key_no}, rx))
     return false;
 
-  aes_decrypt_(resp, app_key_);
+  if (rx.size() != 16)
+    return false;
 
   uint8_t rndB[16];
-  memcpy(rndB, resp, 16);
+  memcpy(rndB, rx.data(), 16);
+
+  uint8_t iv[16];
+  memset(iv, 0, 16);
+
+  uint8_t rndB_dec[16];
+  aes_cbc_decrypt_(key, iv, rndB, rndB_dec, 16);
+
+  uint8_t rndA[16];
+  for (int i = 0; i < 16; i++)
+    rndA[i] = rand() & 0xFF;
 
   uint8_t rndB_rot[16];
-  for (int i=0;i<16;i++)
-    rndB_rot[i] = rndB[(i+1)%16];
+  memcpy(rndB_rot, rndB_dec, 16);
+  rotate_left_(rndB_rot, 16);
 
-  uint8_t buf[32];
-  memcpy(buf, rndA, 16);
-  memcpy(buf+16, rndB_rot, 16);
+  uint8_t msg[32];
+  memcpy(msg, rndA, 16);
+  memcpy(msg + 16, rndB_rot, 16);
 
-  aes_encrypt_(buf, app_key_);
+  memset(iv, 0, 16);
 
-  if (!pn532_->in_data_exchange(buf, 32, resp, &len))
+  uint8_t enc[32];
+  aes_cbc_encrypt_(key, iv, msg, enc, 32);
+
+  std::vector<uint8_t> tx(enc, enc + 32);
+
+  if (!desfire_apdu_(0xAF, tx, rx))
     return false;
 
-  aes_decrypt_(resp, app_key_);
+  if (rx.size() != 16)
+    return false;
 
-  for (int i=0;i<15;i++) {
-    if (resp[i] != rndA[i+1])
-      return false;
-  }
+  uint8_t rndA_rot_card[16];
 
-  memcpy(session_key_, rndA, 4);
-  memcpy(session_key_+4, rndB, 4);
-  memcpy(session_key_+8, rndA+12, 4);
-  memcpy(session_key_+12, rndB+12, 4);
+  aes_cbc_decrypt_(key, iv, rx.data(), rndA_rot_card, 16);
 
-  memset(iv_,0,16);
+  uint8_t rndA_rot[16];
+  memcpy(rndA_rot, rndA, 16);
+  rotate_left_(rndA_rot, 16);
+
+  if (memcmp(rndA_rot_card, rndA_rot, 16) != 0)
+    return false;
+
+  derive_session_key_(rndA, rndB_dec);
+
+  memset(session_iv_, 0, 16);
+
+  session_active_ = true;
+  auth_key_no_ = key_no;
 
   return true;
 }
 
-bool DesfireReader::read_file_secure_(std::vector<uint8_t> &out) {
+void DesfireReader::derive_session_key_(const uint8_t *rndA, const uint8_t *rndB)
+{
+  session_key_[0] = rndA[0];
+  session_key_[1] = rndA[1];
+  session_key_[2] = rndA[2];
+  session_key_[3] = rndA[3];
 
-  uint8_t cmd[8];
+  session_key_[4] = rndB[0];
+  session_key_[5] = rndB[1];
+  session_key_[6] = rndB[2];
+  session_key_[7] = rndB[3];
 
-  cmd[0] = 0xBD;
-  cmd[1] = file_id_;
+  session_key_[8] = rndA[12];
+  session_key_[9] = rndA[13];
+  session_key_[10] = rndA[14];
+  session_key_[11] = rndA[15];
 
-  cmd[2] = file_offset_ & 0xFF;
-  cmd[3] = (file_offset_ >> 8) & 0xFF;
-  cmd[4] = (file_offset_ >> 16) & 0xFF;
+  session_key_[12] = rndB[12];
+  session_key_[13] = rndB[13];
+  session_key_[14] = rndB[14];
+  session_key_[15] = rndB[15];
+}
 
-  cmd[5] = max_payload_len_ & 0xFF;
-  cmd[6] = (max_payload_len_ >> 8) & 0xFF;
-  cmd[7] = (max_payload_len_ >> 16) & 0xFF;
-
-  uint8_t resp[128];
-  uint8_t len;
-
-  if (!pn532_->in_data_exchange(cmd,8,resp,&len))
+bool DesfireReader::read_file_secure(uint8_t file_no,
+                                     uint32_t offset,
+                                     uint32_t length,
+                                     std::vector<uint8_t> &out)
+{
+  if (!session_active_)
     return false;
 
-  mbedtls_aes_context aes;
-  mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_dec(&aes, session_key_, 128);
+  std::vector<uint8_t> cmd;
+
+  cmd.push_back(file_no);
+
+  cmd.push_back(offset & 0xFF);
+  cmd.push_back((offset >> 8) & 0xFF);
+  cmd.push_back((offset >> 16) & 0xFF);
+
+  cmd.push_back(length & 0xFF);
+  cmd.push_back((length >> 8) & 0xFF);
+  cmd.push_back((length >> 16) & 0xFF);
+
+  uint8_t cmac[16];
+
+  aes_cmac_(session_key_, cmd.data(), cmd.size(), cmac);
+
+  std::vector<uint8_t> tx = cmd;
+
+  tx.insert(tx.end(), cmac, cmac + 8);
+
+  std::vector<uint8_t> rx;
+
+  if (!desfire_apdu_(0xBD, tx, rx))
+    return false;
+
+  if (rx.size() < 8)
+    return false;
+
+  size_t enc_len = rx.size() - 8;
 
   uint8_t iv[16];
-  memcpy(iv,iv_,16);
+  memcpy(iv, session_iv_, 16);
 
-  uint8_t outbuf[128];
+  std::vector<uint8_t> dec(enc_len);
 
-  mbedtls_aes_crypt_cbc(&aes,MBEDTLS_AES_DECRYPT,len,iv,resp,outbuf);
+  aes_cbc_decrypt_(session_key_,
+                   iv,
+                   rx.data(),
+                   dec.data(),
+                   enc_len);
 
-  out.assign(outbuf,outbuf+len);
+  out = dec;
 
   return true;
-}
-
-bool DesfireReader::validate_payload_(const std::vector<uint8_t> &data, std::string &out) {
-
-  if (data.size() < 6)
-    return false;
-
-  uint8_t version = data[0];
-
-  if (version != 1)
-    return false;
-
-  uint8_t len = data[1];
-
-  if (len + 6 > data.size())
-    return false;
-
-  uint32_t crc_card =
-    data[2+len] |
-    (data[3+len] << 8) |
-    (data[4+len] << 16) |
-    (data[5+len] << 24);
-
-  uint32_t crc_calc = crc32_(data.data(),2+len);
-
-  if (crc_card != crc_calc)
-    return false;
-
-  out = std::string((char*)&data[2], len);
-
-  return true;
-}
-
-uint32_t DesfireReader::crc32_(const uint8_t *data, size_t len) {
-
-  uint32_t crc = 0xFFFFFFFF;
-
-  for (size_t i=0;i<len;i++) {
-    crc ^= data[i];
-    for (int j=0;j<8;j++) {
-      if (crc & 1)
-        crc = (crc >> 1) ^ 0xEDB88320;
-      else
-        crc >>= 1;
-    }
-  }
-
-  return ~crc;
-}
-
-void DesfireReader::aes_encrypt_(uint8_t *data, uint8_t *key) {
-
-  mbedtls_aes_context aes;
-
-  mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_enc(&aes,key,128);
-
-  uint8_t iv[16];
-  memset(iv,0,16);
-
-  mbedtls_aes_crypt_cbc(&aes,MBEDTLS_AES_ENCRYPT,32,iv,data,data);
-}
-
-void DesfireReader::aes_decrypt_(uint8_t *data, uint8_t *key) {
-
-  mbedtls_aes_context aes;
-
-  mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_dec(&aes,key,128);
-
-  uint8_t iv[16];
-  memset(iv,0,16);
-
-  mbedtls_aes_crypt_cbc(&aes,MBEDTLS_AES_DECRYPT,16,iv,data,data);
-}
-
-}
 }
