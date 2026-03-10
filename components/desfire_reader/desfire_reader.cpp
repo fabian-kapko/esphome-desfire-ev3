@@ -12,6 +12,72 @@ void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  I2C bus recovery — clock out stuck slave, re-init hardware
+// ═══════════════════════════════════════════════════════════════
+
+void DesfireReaderComponent::recover_i2c_bus_() {
+#ifdef USE_ESP32
+  ESP_LOGD(TAG, "I2C bus recovery — clocking out stuck state");
+
+  // Force-reset the I2C peripheral by doing a dummy write that will
+  // timeout, which triggers the ESP-IDF driver's internal reset.
+  // Then send 9 clock pulses on SCL to release any stuck SDA.
+
+  gpio_num_t sda = (gpio_num_t)sda_pin_;
+  gpio_num_t scl = (gpio_num_t)scl_pin_;
+
+  // Temporarily take control of SCL as GPIO to clock out stuck slave
+  gpio_reset_pin(scl);
+  gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
+  gpio_set_level(scl, 1);
+
+  gpio_reset_pin(sda);
+  gpio_set_direction(sda, GPIO_MODE_INPUT);
+  gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+
+  // Clock 9 times — if SDA is stuck low, this lets the slave release it
+  for (int i = 0; i < 9; i++) {
+    gpio_set_level(scl, 0);
+    delayMicroseconds(5);
+    gpio_set_level(scl, 1);
+    delayMicroseconds(5);
+    // Check if SDA is released
+    if (gpio_get_level(sda) == 1)
+      break;
+  }
+
+  // Generate STOP condition: SDA low→high while SCL is high
+  gpio_set_direction(sda, GPIO_MODE_OUTPUT_OD);
+  gpio_set_level(sda, 0);
+  delayMicroseconds(5);
+  gpio_set_level(scl, 1);
+  delayMicroseconds(5);
+  gpio_set_level(sda, 1);
+  delayMicroseconds(5);
+
+  // Release GPIO pins back to I2C peripheral
+  // ESPHome's I2C component will reclaim them on next transaction
+  gpio_reset_pin(sda);
+  gpio_reset_pin(scl);
+
+  // Re-init I2C by doing a small throwaway read
+  // This forces the ESP-IDF I2C driver to re-initialize
+  uint8_t dummy;
+  this->read(&dummy, 1);  // will likely fail, that's OK
+#else
+  // ESP8266: just wait a bit, the hardware is simpler
+  delay(10);
+#endif
+}
+
+void DesfireReaderComponent::pn532_wakeup_() {
+  static const uint8_t wakeup[] = {
+      0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  this->write(wakeup, sizeof(wakeup));
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  PN532 I2C — non-blocking primitives
 // ═══════════════════════════════════════════════════════════════
 
@@ -96,7 +162,7 @@ bool DesfireReaderComponent::try_read_response_(uint8_t command,
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  DESFire APDU — split send/receive
+//  DESFire APDU
 // ═══════════════════════════════════════════════════════════════
 
 bool DesfireReaderComponent::send_desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len) {
@@ -187,7 +253,6 @@ void DesfireReaderComponent::publish_result_(const char *str) {
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::handle_fail_() {
-  // Hard fail — too many retries or non-retryable error
   if (consecutive_fails_ < 255) consecutive_fails_++;
   uint32_t delay_ms = COOLDOWN_FAIL_BASE_MS;
   for (uint8_t i = 1; i < consecutive_fails_ && delay_ms < COOLDOWN_FAIL_MAX_MS; i++)
@@ -195,24 +260,41 @@ void DesfireReaderComponent::handle_fail_() {
   ESP_LOGD(TAG, "Hard fail #%d — cooldown %lu ms", consecutive_fails_, (unsigned long)delay_ms);
   publish_auth_(false);
   retry_count_ = 0;
-  // Force re-detect by clearing prev UID so same card gets re-attempted
   prev_uid_len_ = 0;
-  reset_to_idle_(delay_ms);
+
+  // Recover bus before going idle
+  recover_i2c_bus_();
+  pn532_wakeup_();
+
+  state_ = NfcState::BUS_RECOVERY;
+  state_entered_at_ = millis();
+  cooldown_until_ = millis() + delay_ms;
+  secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
+  secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
+  secure_zero_((volatile uint8_t *)token_, sizeof(token_));
 }
 
 void DesfireReaderComponent::handle_retry_() {
-  // Transient fail — release target and retry
   retry_count_++;
   if (retry_count_ > MAX_RETRIES) {
     ESP_LOGD(TAG, "Max retries (%d) exceeded — hard fail", MAX_RETRIES);
     handle_fail_();
     return;
   }
-  ESP_LOGD(TAG, "Retry %d/%d — releasing target", retry_count_, MAX_RETRIES);
+  ESP_LOGD(TAG, "Retry %d/%d — recovering bus", retry_count_, MAX_RETRIES);
   secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
   secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
   secure_zero_((volatile uint8_t *)token_, sizeof(token_));
-  start_release_();
+
+  // Always recover bus on retry — the timeout may have left it stuck
+  recover_i2c_bus_();
+  pn532_wakeup_();
+
+  // Go to BUS_RECOVERY state, which waits then goes to IDLE for re-detect
+  prev_uid_len_ = 0;  // force re-detect of same card
+  state_ = NfcState::BUS_RECOVERY;
+  state_entered_at_ = millis();
+  cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
 }
 
 void DesfireReaderComponent::reset_to_idle_(uint32_t cooldown_ms) {
@@ -234,15 +316,19 @@ void DesfireReaderComponent::clear_card_state_() {
 }
 
 void DesfireReaderComponent::start_release_() {
-  // Send InRelease (target 1) to reset PN532's target state
   const uint8_t release_cmd[] = {PN532_CMD_IN_RELEASE, 0x01};
   if (this->write_command_(release_cmd, sizeof(release_cmd))) {
     state_ = NfcState::RELEASE_WAIT_ACK;
     state_entered_at_ = millis();
   } else {
-    // If even the release fails, just go idle briefly
-    ESP_LOGW(TAG, "Release send failed");
-    reset_to_idle_(COOLDOWN_RETRY_MS);
+    // Release write failed — bus is stuck, recover it
+    ESP_LOGW(TAG, "Release send failed — recovering bus");
+    recover_i2c_bus_();
+    pn532_wakeup_();
+    prev_uid_len_ = 0;
+    state_ = NfcState::BUS_RECOVERY;
+    state_entered_at_ = millis();
+    cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
   }
 }
 
@@ -302,7 +388,6 @@ void DesfireReaderComponent::setup() {
     delay(2);
   }
 
-  // MaxRetries: 0xFF=no retry limit for ATR, 0x01=1 retry for PSL, 0x01=1 for passive
   const uint8_t rf_cfg[] = {0x12, 0x05, 0xFF, 0x01, 0x01};
   if (this->write_command_(rf_cfg, sizeof(rf_cfg))) {
     start = millis();
@@ -325,7 +410,6 @@ void DesfireReaderComponent::setup() {
     }
   }
 
-  // RF timeouts: shorter = faster fail on bad cards
   const uint8_t rf_timeout[] = {0x12, 0x02, 0x00, 0x0B, 0x0A};
   if (this->write_command_(rf_timeout, sizeof(rf_timeout))) {
     start = millis();
@@ -351,7 +435,7 @@ void DesfireReaderComponent::setup() {
   state_ = NfcState::IDLE;
   cooldown_until_ = 0;
   update_requested_ = false;
-  ESP_LOGCONFIG(TAG, "PN532 initialized.");
+  ESP_LOGCONFIG(TAG, "PN532 initialized (SDA=%d SCL=%d).", sda_pin_, scl_pin_);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -364,7 +448,7 @@ void DesfireReaderComponent::update() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  loop() — runs every ~16ms, one I2C op per call
+//  loop() — non-blocking state machine
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::loop() {
@@ -386,11 +470,26 @@ void DesfireReaderComponent::loop() {
 
     const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
     if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
-      reset_to_idle_(50);
+      // Write failed — bus might be stuck
+      recover_i2c_bus_();
+      pn532_wakeup_();
+      state_ = NfcState::BUS_RECOVERY;
+      state_entered_at_ = millis();
+      cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
       return;
     }
     state_ = NfcState::DETECT_WAIT_ACK;
     state_entered_at_ = now;
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  case NfcState::BUS_RECOVERY: {
+    // Wait for bus to settle after recovery, then go to IDLE
+    if ((int32_t)(cooldown_until_ - now) > 0)
+      return;
+    state_ = NfcState::IDLE;
+    update_requested_ = true;
     return;
   }
 
@@ -430,7 +529,7 @@ void DesfireReaderComponent::loop() {
             uid_len = 0;
         }
 
-        // Same card still present — skip re-auth
+        // Same card still present
         if (uid_len > 0 && uid_len == prev_uid_len_ &&
             memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
           reset_to_idle_(COOLDOWN_SUCCESS_MS);
@@ -457,7 +556,6 @@ void DesfireReaderComponent::loop() {
         return;
       }
 
-      // No card
       if (no_card_count_ < 255) no_card_count_++;
       if (no_card_count_ >= NO_CARD_THRESHOLD && card_present_)
         clear_card_state_();
@@ -509,7 +607,6 @@ void DesfireReaderComponent::loop() {
       }
       ESP_LOGE(TAG, "SelectApp FAILED — app %02X%02X%02X not on card?",
                app_id_[0], app_id_[1], app_id_[2]);
-      // Wrong app = not retryable, different card type
       handle_fail_();
       return;
     }
@@ -619,7 +716,7 @@ void DesfireReaderComponent::loop() {
     if (read_desfire_apdu_(resp2, sizeof(resp2), resp2_len, sw1, sw2)) {
       if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
         ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
-        handle_fail_();  // wrong key = not retryable
+        handle_fail_();
         return;
       }
       if (resp2_len != 16) {
@@ -648,7 +745,7 @@ void DesfireReaderComponent::loop() {
 
       if (diff != 0) {
         ESP_LOGE(TAG, "Mutual auth FAILED — RndA' mismatch");
-        handle_fail_();  // crypto mismatch = not retryable
+        handle_fail_();
         return;
       }
 
@@ -770,11 +867,13 @@ void DesfireReaderComponent::loop() {
       return;
     }
     if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
-      // Release ACK failed — just go to idle briefly, then auto-retry
-      ESP_LOGD(TAG, "Release ACK timeout — resetting");
-      // Clear prev UID so re-detect picks up the same card
+      ESP_LOGD(TAG, "Release ACK timeout — recovering bus");
+      recover_i2c_bus_();
+      pn532_wakeup_();
       prev_uid_len_ = 0;
-      reset_to_idle_(COOLDOWN_RETRY_MS);
+      state_ = NfcState::BUS_RECOVERY;
+      state_entered_at_ = millis();
+      cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
     }
     return;
   }
@@ -785,17 +884,20 @@ void DesfireReaderComponent::loop() {
     uint8_t resp_len;
 
     if (try_read_response_(PN532_CMD_IN_RELEASE, resp, sizeof(resp), resp_len)) {
-      ESP_LOGD(TAG, "Target released — re-detecting for retry");
-      // Go back to IDLE with short cooldown, prev_uid cleared so it re-detects
+      ESP_LOGD(TAG, "Target released — re-detecting");
       prev_uid_len_ = 0;
       reset_to_idle_(COOLDOWN_RETRY_MS);
       return;
     }
 
     if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGD(TAG, "Release resp timeout — resetting");
+      ESP_LOGD(TAG, "Release resp timeout — recovering bus");
+      recover_i2c_bus_();
+      pn532_wakeup_();
       prev_uid_len_ = 0;
-      reset_to_idle_(COOLDOWN_RETRY_MS);
+      state_ = NfcState::BUS_RECOVERY;
+      state_entered_at_ = millis();
+      cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
     }
     return;
   }
@@ -806,7 +908,7 @@ void DesfireReaderComponent::loop() {
 void DesfireReaderComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "DESFire Reader:");
   ESP_LOGCONFIG(TAG, "  App ID: %02X:%02X:%02X", app_id_[0], app_id_[1], app_id_[2]);
-  ESP_LOGCONFIG(TAG, "  Mode: non-blocking state machine");
+  ESP_LOGCONFIG(TAG, "  SDA: GPIO%d  SCL: GPIO%d", sda_pin_, scl_pin_);
   ESP_LOGCONFIG(TAG, "  Retries: %d", MAX_RETRIES);
   LOG_I2C_DEVICE(this);
 }
@@ -892,40 +994,43 @@ void aes_enc_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
   for (int r = 1; r <= 10; r++) {
     for (int i = 0; i < 16; i++) s[i] = sbox_rd(AES_SBOX, s[i]);
     uint8_t t;
-    t=s[1];s[1]=s[5];s[5]=s[9];s[9]=s[13];s[13]=t;
-    t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
-    t=s[15];s[15]=s[11];s[11]=s[7];s[7]=s[3];s[3]=t;
+    t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+    t = s[2]; s[2] = s[10]; s[10] = t;
+    t = s[6]; s[6] = s[14]; s[14] = t;
+    t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
     if (r < 10) {
       for (int c = 0; c < 4; c++) {
-        uint8_t *col=s+c*4, a=col[0], b=col[1], cc=col[2], d=col[3];
-        col[0]=xtime_(a)^xtime_(b)^b^cc^d;
-        col[1]=a^xtime_(b)^xtime_(cc)^cc^d;
-        col[2]=a^b^xtime_(cc)^xtime_(d)^d;
-        col[3]=xtime_(a)^a^b^cc^xtime_(d);
+        uint8_t *col = s + c * 4, a = col[0], b = col[1], cc = col[2], d = col[3];
+        col[0] = xtime_(a) ^ xtime_(b) ^ b ^ cc ^ d;
+        col[1] = a ^ xtime_(b) ^ xtime_(cc) ^ cc ^ d;
+        col[2] = a ^ b ^ xtime_(cc) ^ xtime_(d) ^ d;
+        col[3] = xtime_(a) ^ a ^ b ^ cc ^ xtime_(d);
       }
     }
-    for (int i = 0; i < 16; i++) s[i] ^= rk[r*16+i];
+    for (int i = 0; i < 16; i++) s[i] ^= rk[r * 16 + i];
   }
   memcpy(out, s, 16);
 }
+
 void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
   uint8_t s[16];
   memcpy(s, in, 16);
-  for (int i = 0; i < 16; i++) s[i] ^= rk[10*16+i];
+  for (int i = 0; i < 16; i++) s[i] ^= rk[10 * 16 + i];
   for (int r = 9; r >= 0; r--) {
     uint8_t t;
-    t=s[13];s[13]=s[9];s[9]=s[5];s[5]=s[1];s[1]=t;
-    t=s[10];s[10]=s[2];s[2]=t; t=s[14];s[14]=s[6];s[6]=t;
-    t=s[3];s[3]=s[7];s[7]=s[11];s[11]=s[15];s[15]=t;
+    t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t;
+    t = s[10]; s[10] = s[2]; s[2] = t;
+    t = s[14]; s[14] = s[6]; s[6] = t;
+    t = s[3]; s[3] = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = t;
     for (int i = 0; i < 16; i++) s[i] = sbox_rd(AES_RSBOX, s[i]);
-    for (int i = 0; i < 16; i++) s[i] ^= rk[r*16+i];
+    for (int i = 0; i < 16; i++) s[i] ^= rk[r * 16 + i];
     if (r == 0) break;
     for (int c = 0; c < 4; c++) {
-      uint8_t *col=s+c*4, a=col[0], b=col[1], cc=col[2], d=col[3];
-      col[0]=mul_(a,0xe)^mul_(b,0xb)^mul_(cc,0xd)^mul_(d,0x9);
-      col[1]=mul_(a,0x9)^mul_(b,0xe)^mul_(cc,0xb)^mul_(d,0xd);
-      col[2]=mul_(a,0xd)^mul_(b,0x9)^mul_(cc,0xe)^mul_(d,0xb);
-      col[3]=mul_(a,0xb)^mul_(b,0xd)^mul_(cc,0x9)^mul_(d,0xe);
+      uint8_t *col = s + c * 4, a = col[0], b = col[1], cc = col[2], d = col[3];
+      col[0] = mul_(a, 0xe) ^ mul_(b, 0xb) ^ mul_(cc, 0xd) ^ mul_(d, 0x9);
+      col[1] = mul_(a, 0x9) ^ mul_(b, 0xe) ^ mul_(cc, 0xb) ^ mul_(d, 0xd);
+      col[2] = mul_(a, 0xd) ^ mul_(b, 0x9) ^ mul_(cc, 0xe) ^ mul_(d, 0xb);
+      col[3] = mul_(a, 0xb) ^ mul_(b, 0xd) ^ mul_(cc, 0x9) ^ mul_(d, 0xe);
     }
   }
   memcpy(out, s, 16);

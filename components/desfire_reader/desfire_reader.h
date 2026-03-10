@@ -9,6 +9,8 @@
 
 #ifdef USE_ESP32
 #include <esp_random.h>
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #endif
 
 namespace esphome {
@@ -25,22 +27,20 @@ static const uint8_t PN532_CMD_IN_RELEASE       = 0x52;
 
 static const uint8_t PN532_BUF_SIZE = 64;
 
-// Cooldowns (ms)
 static const uint16_t COOLDOWN_SUCCESS_MS   = 150;
-static const uint16_t COOLDOWN_RETRY_MS     = 30;    // retry after transient fail
+static const uint16_t COOLDOWN_RETRY_MS     = 50;
 static const uint16_t COOLDOWN_FAIL_BASE_MS = 100;
 static const uint32_t COOLDOWN_FAIL_MAX_MS  = 5000;
 static const uint8_t  NO_CARD_THRESHOLD     = 2;
-static const uint8_t  MAX_RETRIES           = 2;     // retry auth this many times before giving up
+static const uint8_t  MAX_RETRIES           = 2;
 
-// Forward declarations of standalone AES helpers (defined in .cpp)
 void aes_key_exp_(const uint8_t *key, uint8_t *rk);
 void aes_enc_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
 void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out);
 
-// ── State machine states ──
 enum class NfcState : uint8_t {
   IDLE,
+  BUS_RECOVERY,          // waiting after I2C bus recovery
   DETECT_WAIT_ACK,
   DETECT_WAIT_RESP,
   SELECT_WAIT_ACK,
@@ -52,7 +52,7 @@ enum class NfcState : uint8_t {
   READ_WAIT_ACK,
   READ_WAIT_RESP,
   PUBLISH,
-  RELEASE_WAIT_ACK,     // release target after fail, then re-detect
+  RELEASE_WAIT_ACK,
   RELEASE_WAIT_RESP,
 };
 
@@ -86,6 +86,9 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_auth_sensor(binary_sensor::BinarySensor *s)  { auth_sensor_ = s; }
   void set_uid_sensor(text_sensor::TextSensor *s)       { uid_sensor_ = s; }
 
+  void set_sda_pin(int pin) { sda_pin_ = pin; }
+  void set_scl_pin(int pin) { scl_pin_ = pin; }
+
  protected:
   bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
   bool try_read_ack_();
@@ -107,12 +110,14 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void publish_auth_(bool state);
   void publish_result_(const char *str);
 
-  void handle_fail_();          // hard fail — give up on this card
-  void handle_retry_();         // transient fail — release target and retry
+  void handle_fail_();
+  void handle_retry_();
   void reset_to_idle_(uint32_t cooldown_ms);
   void clear_card_state_();
-  void start_release_();        // send InRelease to reset PN532 target state
-  void start_select_app_();     // begin SelectApp (reused for retries)
+  void start_release_();
+  void start_select_app_();
+  void recover_i2c_bus_();       // reset I2C hardware + clock out stuck SDA
+  void pn532_wakeup_();          // re-wake PN532 after bus recovery
 
   // ── Config ──
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
@@ -120,6 +125,9 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t data_key_[16]{};
   uint8_t app_rk_[176]{};
   uint8_t data_rk_[176]{};
+
+  int sda_pin_{21};
+  int scl_pin_{22};
 
   // ── Sensors ──
   text_sensor::TextSensor     *result_sensor_{nullptr};
@@ -143,7 +151,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   bool     card_present_{false};
   uint8_t  no_card_count_{0};
   uint8_t  consecutive_fails_{0};
-  uint8_t  retry_count_{0};          // retries for current card
+  uint8_t  retry_count_{0};
 
   // ── Carried between states ──
   char     current_uid_str_[24]{};
@@ -161,6 +169,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   static const uint16_t ACK_TIMEOUT_MS    = 50;
   static const uint16_t RESP_TIMEOUT_MS   = 150;
   static const uint16_t DETECT_TIMEOUT_MS = 200;
+  static const uint16_t BUS_RECOVERY_MS   = 30;    // settle time after bus recovery
 };
 
 }  // namespace desfire_reader
