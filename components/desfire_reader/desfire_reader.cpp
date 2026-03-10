@@ -908,7 +908,6 @@ void aes_enc_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
   }
   memcpy(out, s, 16);
 }
-
 void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
   uint8_t s[16];
   memcpy(s, in, 16);
@@ -924,4 +923,44 @@ void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
     for (int c = 0; c < 4; c++) {
       uint8_t *col=s+c*4, a=col[0], b=col[1], cc=col[2], d=col[3];
       col[0]=mul_(a,0xe)^mul_(b,0xb)^mul_(cc,0xd)^mul_(d,0x9);
-      col[
+      col[1]=mul_(a,0x9)^mul_(b,0xe)^mul_(cc,0xb)^mul_(d,0xd);
+      col[2]=mul_(a,0xd)^mul_(b,0x9)^mul_(cc,0xe)^mul_(d,0xb);
+      col[3]=mul_(a,0xb)^mul_(b,0xd)^mul_(cc,0x9)^mul_(d,0xe);
+    }
+  }
+  memcpy(out, s, 16);
+}
+
+bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
+                                              const uint8_t *iv_in,
+                                              uint8_t *out) {
+  if (len % 16 != 0)
+    return false;
+  uint8_t iv[16];
+  if (iv_in != nullptr)
+    memcpy(iv, iv_in, 16);
+  else
+    memset(iv, 0, 16);
+  for (uint8_t b = 0; b < len; b += 16) {
+    aes_dec_block_(data_rk_, in + b, out + b);
+    for (uint8_t i = 0; i < 16; i++)
+      out[b + i] ^= iv[i];
+    memcpy(iv, in + b, 16);
+  }
+  return true;
+}
+
+void DesfireReaderComponent::random_bytes_(uint8_t *buf, uint8_t len) {
+#ifdef USE_ESP32
+  esp_fill_random(buf, len);
+#elif defined(USE_ESP8266)
+  for (uint8_t i = 0; i < len; i++)
+    buf[i] = static_cast<uint8_t>(*(volatile uint32_t *)0x3FF20E44);
+#else
+  for (uint8_t i = 0; i < len; i++)
+    buf[i] = static_cast<uint8_t>(esp_random());
+#endif
+}
+
+}  // namespace desfire_reader
+}  // namespace esphome
