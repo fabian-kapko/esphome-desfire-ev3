@@ -10,6 +10,14 @@
 namespace esphome {
 namespace desfire_reader {
 
+// ── Helper: log a 16-byte buffer ──
+static void log_hex16_(const char *label, const uint8_t *buf) {
+  ESP_LOGD(TAG, "  %s: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+           label,
+           buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+           buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Raw PN532 I2C frame protocol
 // ═══════════════════════════════════════════════════════════════
@@ -102,8 +110,8 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Publish helpers — only fire when the value actually changes
-// ══════════════════════════════════════════════════════════════���
+//  Publish helpers
+// ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::format_uid_(const uint8_t *uid_bytes,
                                          uint8_t uid_len, char *out) {
@@ -119,8 +127,7 @@ void DesfireReaderComponent::format_uid_(const uint8_t *uid_bytes,
 }
 
 void DesfireReaderComponent::publish_uid_(const char *uid_str) {
-  if (!uid_sensor_)
-    return;
+  if (!uid_sensor_) return;
   if (strcmp(uid_str, last_uid_) != 0) {
     size_t len = strlen(uid_str);
     if (len >= sizeof(last_uid_)) len = sizeof(last_uid_) - 1;
@@ -131,8 +138,7 @@ void DesfireReaderComponent::publish_uid_(const char *uid_str) {
 }
 
 void DesfireReaderComponent::publish_auth_(bool state) {
-  if (!auth_sensor_)
-    return;
+  if (!auth_sensor_) return;
   if (state != last_auth_) {
     last_auth_ = state;
     auth_sensor_->publish_state(state);
@@ -140,8 +146,7 @@ void DesfireReaderComponent::publish_auth_(bool state) {
 }
 
 void DesfireReaderComponent::publish_result_(const char *str) {
-  if (!result_sensor_)
-    return;
+  if (!result_sensor_) return;
   if (strcmp(str, last_result_) != 0) {
     size_t len = strlen(str);
     if (len >= sizeof(last_result_)) len = sizeof(last_result_) - 1;
@@ -193,7 +198,7 @@ void DesfireReaderComponent::setup() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Update — cooldown + UID dedup
+//  Update
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
@@ -327,7 +332,7 @@ void DesfireReaderComponent::dump_config() {
 
 // ═══════════════════════════════════════════════════════════════
 //  DESFire APDU via PN532 InDataExchange
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════���══════════
 
 bool DesfireReaderComponent::desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len,
                                            uint8_t *response, uint8_t resp_cap,
@@ -380,87 +385,17 @@ bool DesfireReaderComponent::df_select_app_() {
   return sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK;
 }
 
-// ── DESFire legacy AuthenticateAES (INS 0xAA) with full mutual verification ──
+// DESFire legacy AuthenticateAES (0xAA) with full mutual verification.
 //
-// Protocol (NXP AN10833 / data sheet §11.6.1.1):
+// We try all three candidate IVs for decrypting the card's response,
+// since different DESFire versions/implementations may use different
+// CBC IV management strategies:
 //
-//   Step 1:  Reader  →  Card:  [90 AA 00 00 01 00 00]
-//            Card    →  Reader: E_k(RndB), 16 bytes,  SW 91AF
+//   1. IV = token[16..31]  (continuous single IV — NXP AN10833)
+//   2. IV = resp1          (separate send IV from step 1)
+//   3. IV = 0              (fresh IV per message)
 //
-//   Step 2:  Reader decrypts E_k(RndB) with IV=0 to get RndB.
-//            Reader generates RndA (16 random bytes).
-//            Reader encrypts (RndA ∥ RndB') with CBC IV=0  (RndB' = rotate-left-1(RndB)).
-//            Reader  →  Card:  [90 AF 00 00 20 <32 bytes> 00]
-//            Card    →  Reader: E_k(RndA'), 16 bytes,  SW 9100
-//
-//   Step 3:  Reader decrypts E_k(RndA') and verifies it equals rotate-left-1(RndA).
-//
-// CBC IV tracking — the DESFire legacy auth uses a SINGLE shared IV that
-// chains across ALL operations in both directions:
-//
-//   Initial IV = 0x00..00
-//
-//   Card encrypts RndB:       ciphertext = Enc(RndB ⊕ IV=0)
-//                              IV becomes E_k(RndB) = resp1
-//
-//   Reader decrypts resp1:    plaintext = Dec(resp1) ⊕ IV=0  → RndB
-//                              IV becomes resp1
-//
-//   Reader encrypts RndA:     ciphertext[0] = Enc(RndA ⊕ IV=resp1)   → token[0..15]
-//                              IV becomes token[0..15]
-//   Reader encrypts RndB':   ciphertext[1] = Enc(RndB' ⊕ token[0..15]) → token[16..31]
-//                              IV becomes token[16..31]
-//
-//   Card decrypts token:      (mirrors the above)
-//                              IV becomes token[16..31]
-//
-//   Card encrypts RndA':     ciphertext = Enc(RndA' ⊕ IV=token[16..31])
-//                              → resp2
-//
-//   Reader decrypts resp2:    plaintext = Dec(resp2) ⊕ IV=token[16..31]  → RndA'
-//
-// CRITICAL: The reader's decrypt in step 1 used IV=0 (single block = ECB).
-// But steps 1+2 were done as separate operations without carrying the IV.
-// The ORIGINAL code encrypted with IV=0 (fresh), which means the card also
-// sees a fresh IV=0 for decryption.  So the card's send-side IV after
-// processing our 2 blocks = our second ciphertext block = token[16..31].
-//
-// HOWEVER: our step 1 decrypt used a raw aes_dec_block_ (no CBC XOR with
-// IV=0, which is fine since XOR with 0 is identity).  But this means we
-// treated step 1 as standalone — and step 2 encryption also starts with
-// IV=0 independently.  This is actually the same as what the Python code
-// does:  AES.new(key, CBC, iv=zeros).encrypt(rnd_a + rnd_b_rot) — a FRESH
-// cipher with IV=0.
-//
-// Since both sides start step 2 with IV=0 (the Python provisioner creates a
-// brand new AES.new() with iv_zero for step 2), the card's encryption of
-// RndA' uses as IV the last ciphertext block from step 2 = token[16..31].
-//
-// BUT WAIT — the card doesn't necessarily reset the IV between the two
-// APDUs the same way.  The APDU wrapping (ISO 7816) is just transport.
-// The DESFire protocol maintains a continuous CBC IV across the entire
-// auth handshake, not per-APDU.
-//
-// Let's trace what the CARD does:
-//   - Card init: IV = 0
-//   - Card encrypts RndB with IV=0: E(RndB⊕0) = resp1.  IV → resp1
-//   - Card receives our token (32 bytes).  Card decrypts with CBC:
-//       Dec(token[0..15]) ⊕ resp1 → should give RndA (but we encrypted
-//       with IV=0, not resp1!).
-//
-// AH — this is the key problem.  In the ORIGINAL code (and the Python code),
-// step 2 encryption uses IV=0, NOT the carried-over IV from step 1.
-// This means the reader and card are NOT maintaining a continuous IV.
-// Instead, each "message" starts with IV=0.
-//
-// This actually matches the DESFire documentation for legacy auth: each
-// command/response is independently encrypted with IV=0.
-//
-// So for the card's response in step 3:
-//   - Card encrypts RndA' with IV=0  (fresh per-message)
-//   - resp2 = Enc(RndA' ⊕ 0) = Enc(RndA')
-//   - To decrypt: RndA' = Dec(resp2) ⊕ 0 = Dec(resp2)
-//   - This is just a raw block decrypt (aes_dec_block_).
+// Whichever matches proves the card knows the key.
 
 bool DesfireReaderComponent::df_auth_aes_() {
   // Step 1: AuthenticateAES (INS=0xAA), key number 0
@@ -473,26 +408,30 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16)
     return false;
 
-  // Decrypt E_k(RndB) — single block, IV=0 means just raw decrypt
+  // Save E_k(RndB) before decrypting
+  uint8_t enc_rnd_b[16];
+  memcpy(enc_rnd_b, resp1, 16);
+
+  // Decrypt E_k(RndB) — single block, IV=0
   uint8_t rnd_b[16];
   aes_dec_block_(app_rk_, resp1, rnd_b);
 
-  // Generate RndA using hardware RNG
+  // Generate RndA
   uint8_t rnd_a[16];
   random_bytes_(rnd_a, 16);
 
-  // Rotate RndB left by 1 byte
+  // Rotate RndB left by 1 byte → RndB'
   uint8_t rnd_b_rot[16];
   memcpy(rnd_b_rot, rnd_b + 1, 15);
   rnd_b_rot[15] = rnd_b[0];
 
   // Encrypt (RndA || RndB') with AES-CBC, IV=0
   uint8_t token[32];
-  aes_enc_block_(app_rk_, rnd_a, token);            // Enc(RndA ⊕ 0)
+  aes_enc_block_(app_rk_, rnd_a, token);
   uint8_t tmp[16];
   for (uint8_t i = 0; i < 16; i++)
-    tmp[i] = rnd_b_rot[i] ^ token[i];               // CBC chaining
-  aes_enc_block_(app_rk_, tmp, token + 16);          // Enc(RndB' ⊕ token[0..15])
+    tmp[i] = rnd_b_rot[i] ^ token[i];
+  aes_enc_block_(app_rk_, tmp, token + 16);
 
   // Build APDU: [90 AF 00 00 20 <32 bytes> 00]
   uint8_t apdu2[38];
@@ -511,45 +450,64 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
     return false;
 
-  // ── Verify card's proof ──
   if (resp2_len != 16) {
     ESP_LOGE(TAG, "Auth response wrong length (%d, expected 16)", resp2_len);
     return false;
   }
 
-  // Card encrypted RndA' as a single block with IV=0 (same as step 1).
-  // Decrypt with raw ECB (aes_dec_block_ = AES-CBC with IV=0 for 1 block).
-  uint8_t rnd_a_card[16];
-  aes_dec_block_(app_rk_, resp2, rnd_a_card);
-
-  // Expected: RndA rotated left by 1 byte
+  // Build expected RndA' = RndA rotated left by 1 byte
   uint8_t rnd_a_expected[16];
   memcpy(rnd_a_expected, rnd_a + 1, 15);
   rnd_a_expected[15] = rnd_a[0];
 
-  // Constant-time comparison
-  uint8_t diff = 0;
-  for (uint8_t i = 0; i < 16; i++)
-    diff |= rnd_a_card[i] ^ rnd_a_expected[i];
+  // Raw decrypt of resp2 (no CBC XOR = same as IV=0)
+  uint8_t raw_dec[16];
+  aes_dec_block_(app_rk_, resp2, raw_dec);
 
-  if (diff != 0) {
-    // Debug: dump both values so you can diagnose
-    ESP_LOGE(TAG, "Mutual auth FAILED — card did not prove key knowledge");
-    ESP_LOGD(TAG, "  Expected RndA': %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
-             rnd_a_expected[0], rnd_a_expected[1], rnd_a_expected[2], rnd_a_expected[3],
-             rnd_a_expected[4], rnd_a_expected[5], rnd_a_expected[6], rnd_a_expected[7],
-             rnd_a_expected[8], rnd_a_expected[9], rnd_a_expected[10], rnd_a_expected[11],
-             rnd_a_expected[12], rnd_a_expected[13], rnd_a_expected[14], rnd_a_expected[15]);
-    ESP_LOGD(TAG, "  Got      RndA': %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
-             rnd_a_card[0], rnd_a_card[1], rnd_a_card[2], rnd_a_card[3],
-             rnd_a_card[4], rnd_a_card[5], rnd_a_card[6], rnd_a_card[7],
-             rnd_a_card[8], rnd_a_card[9], rnd_a_card[10], rnd_a_card[11],
-             rnd_a_card[12], rnd_a_card[13], rnd_a_card[14], rnd_a_card[15]);
-    return false;
+  // Debug dump all values
+  log_hex16_("enc_rnd_b  ", enc_rnd_b);
+  log_hex16_("rnd_a      ", rnd_a);
+  log_hex16_("token[0:15]", token);
+  log_hex16_("token[16:] ", token + 16);
+  log_hex16_("resp2      ", resp2);
+  log_hex16_("Dec(resp2) ", raw_dec);
+  log_hex16_("expected   ", rnd_a_expected);
+
+  // Try all three candidate IVs
+  struct { const char *name; const uint8_t *iv; } candidates[] = {
+    {"token[16:31]", token + 16},
+    {"enc_rnd_b   ", enc_rnd_b},
+    {"zero        ", nullptr}
+  };
+
+  for (auto &c : candidates) {
+    uint8_t plain[16];
+    if (c.iv != nullptr) {
+      for (uint8_t i = 0; i < 16; i++)
+        plain[i] = raw_dec[i] ^ c.iv[i];
+    } else {
+      memcpy(plain, raw_dec, 16);
+    }
+
+    uint8_t diff = 0;
+    for (uint8_t i = 0; i < 16; i++)
+      diff |= plain[i] ^ rnd_a_expected[i];
+
+    ESP_LOGD(TAG, "  IV=%s → diff=%d", c.name, diff);
+    if (diff == 0) {
+      ESP_LOGD(TAG, "Mutual auth verified with IV=%s — card is genuine", c.name);
+      return true;
+    }
   }
 
-  ESP_LOGD(TAG, "Mutual authentication verified — card is genuine");
-  return true;
+  // None matched — dump what XOR would need to be for diagnosis
+  uint8_t needed_iv[16];
+  for (uint8_t i = 0; i < 16; i++)
+    needed_iv[i] = raw_dec[i] ^ rnd_a_expected[i];
+  log_hex16_("needed IV  ", needed_iv);
+
+  ESP_LOGE(TAG, "Mutual auth FAILED — no IV candidate matched");
+  return false;
 }
 
 bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
