@@ -25,9 +25,10 @@ static const uint8_t PN532_CMD_IN_LIST_PASSIVE  = 0x4A;
 static const uint8_t PN532_BUF_SIZE = 64;
 
 // Cooldowns (ms)
-static const uint16_t COOLDOWN_SUCCESS_MS   = 500;
-static const uint16_t COOLDOWN_FAIL_BASE_MS = 200;
-static const uint32_t COOLDOWN_FAIL_MAX_MS  = 30000;
+static const uint16_t COOLDOWN_SUCCESS_MS   = 150;   // was 500 — faster re-detect of same card
+static const uint16_t COOLDOWN_FAIL_BASE_MS = 100;   // was 200 — faster retry
+static const uint32_t COOLDOWN_FAIL_MAX_MS  = 5000;  // was 30000 — cap at 5s not 30s
+static const uint8_t  NO_CARD_THRESHOLD     = 2;     // was 3 — faster card-removed detection
 
 // Forward declarations of standalone AES helpers (defined in .cpp)
 void aes_key_exp_(const uint8_t *key, uint8_t *rk);
@@ -53,8 +54,8 @@ enum class NfcState : uint8_t {
 class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
  public:
   void setup() override;
-  void update() override;   // triggers new detection cycle
-  void loop() override;     // advances state machine every ~16ms
+  void update() override;
+  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
@@ -81,13 +82,11 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_uid_sensor(text_sensor::TextSensor *s)       { uid_sensor_ = s; }
 
  protected:
-  // ── PN532 I2C frame layer (non-blocking) ──
   bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
   bool try_read_ack_();
   bool try_read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
                           uint8_t &resp_len);
 
-  // ── DESFire APDU (split send/receive) ──
   bool send_desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len);
   bool read_desfire_apdu_(uint8_t *response, uint8_t resp_cap,
                           uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
@@ -105,6 +104,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
 
   void handle_fail_();
   void reset_to_idle_(uint32_t cooldown_ms);
+  void clear_card_state_();
 
   // ── Config ──
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
@@ -127,7 +127,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   NfcState state_{NfcState::IDLE};
   uint32_t cooldown_until_{0};
   uint32_t state_entered_at_{0};
-  bool     update_requested_{false};  // update() sets this to trigger detection
+  bool     update_requested_{false};
 
   // ── Card tracking ──
   uint8_t  prev_uid_[7]{};
@@ -148,9 +148,10 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t  raw_file_[48]{};
   uint8_t  raw_file_len_{0};
 
-  // ── Timeouts ──
-  static const uint16_t ACK_TIMEOUT_MS   = 150;
-  static const uint16_t RESP_TIMEOUT_MS  = 500;
+  // ── Timeouts — tuned for PN532 actual response times ──
+  static const uint16_t ACK_TIMEOUT_MS    = 50;    // was 150 — PN532 ACKs within 5ms normally
+  static const uint16_t RESP_TIMEOUT_MS   = 150;   // was 500 — PN532 responds within 50ms normally
+  static const uint16_t DETECT_TIMEOUT_MS = 200;   // detection can take longer (RF field scan)
 };
 
 }  // namespace desfire_reader

@@ -208,6 +208,15 @@ void DesfireReaderComponent::reset_to_idle_(uint32_t cooldown_ms) {
   secure_zero_((volatile uint8_t *)token_, sizeof(token_));
 }
 
+void DesfireReaderComponent::clear_card_state_() {
+  card_present_ = false;
+  prev_uid_len_ = 0;
+  publish_auth_(false);
+  publish_result_("");
+  publish_uid_("");
+  ESP_LOGD(TAG, "Card removed");
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Setup
 // ═══════════════════════════════════════════════════════════════
@@ -223,7 +232,6 @@ void DesfireReaderComponent::setup() {
   this->write(wakeup, sizeof(wakeup));
   delay(10);
 
-  // SAMConfiguration — brief blocking at boot only
   const uint8_t sam_cmd[] = {0x14, 0x01, 0x14, 0x00};
   if (!this->write_command_(sam_cmd, sizeof(sam_cmd))) {
     ESP_LOGE(TAG, "PN532 not responding — check I2C wiring (addr 0x%02X)",
@@ -232,12 +240,11 @@ void DesfireReaderComponent::setup() {
     return;
   }
 
-  // Wait for ACK (max 50ms)
   uint32_t start = millis();
   bool ack_ok = false;
   while (millis() - start < 50) {
     if (try_read_ack_()) { ack_ok = true; break; }
-    delay(2);
+    delay(1);
   }
   if (!ack_ok) {
     ESP_LOGE(TAG, "PN532 SAM ACK timeout — check wiring");
@@ -245,24 +252,24 @@ void DesfireReaderComponent::setup() {
     return;
   }
 
-  // Wait for SAM response (max 100ms)
   uint8_t sam_resp[8];
   uint8_t sam_len = 0;
   start = millis();
   while (millis() - start < 100) {
     if (try_read_response_(0x14, sam_resp, sizeof(sam_resp), sam_len))
       break;
-    delay(3);
+    delay(2);
   }
 
-  // RFConfiguration MaxRetries
-  const uint8_t rf_cfg[] = {0x12, 0x05, 0xFF, 0x01, 0x02};
+  // RFConfiguration: MaxRetries = 1 for ATR, 2 for PSL, 1 for passive activation
+  // Lower retries = faster fail when card isn't responding
+  const uint8_t rf_cfg[] = {0x12, 0x05, 0xFF, 0x01, 0x01};
   if (this->write_command_(rf_cfg, sizeof(rf_cfg))) {
     start = millis();
     ack_ok = false;
     while (millis() - start < 50) {
       if (try_read_ack_()) { ack_ok = true; break; }
-      delay(2);
+      delay(1);
     }
     if (ack_ok) {
       uint8_t rf_resp[4];
@@ -273,13 +280,39 @@ void DesfireReaderComponent::setup() {
           ESP_LOGCONFIG(TAG, "PN532 MaxRetries configured OK.");
           break;
         }
-        delay(3);
+        delay(2);
       }
     } else {
       ESP_LOGW(TAG, "PN532 RFConfiguration ACK failed — using defaults.");
     }
   } else {
     ESP_LOGW(TAG, "PN532 RFConfiguration write failed — using defaults.");
+  }
+
+  // RFConfiguration: RF field timeout
+  // item 0x02 = RFField, timeout values for ATR_RES and overall
+  // Shorter timeout = faster detection of absent/bad cards
+  const uint8_t rf_timeout[] = {0x12, 0x02, 0x00, 0x0B, 0x0A};
+  // 0x0B = ~150ms ATR timeout, 0x0A = ~100ms overall
+  if (this->write_command_(rf_timeout, sizeof(rf_timeout))) {
+    start = millis();
+    ack_ok = false;
+    while (millis() - start < 50) {
+      if (try_read_ack_()) { ack_ok = true; break; }
+      delay(1);
+    }
+    if (ack_ok) {
+      uint8_t to_resp[4];
+      uint8_t to_len;
+      start = millis();
+      while (millis() - start < 100) {
+        if (try_read_response_(0x12, to_resp, sizeof(to_resp), to_len)) {
+          ESP_LOGCONFIG(TAG, "PN532 RF timeouts configured.");
+          break;
+        }
+        delay(2);
+      }
+    }
   }
 
   state_ = NfcState::IDLE;
@@ -289,18 +322,16 @@ void DesfireReaderComponent::setup() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  update() — called at update_interval, just flags "time to poll"
+//  update() — just flags "time to poll"
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
-  // Only request a new detection if we're idle
   if (state_ == NfcState::IDLE)
     update_requested_ = true;
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  loop() — called every ~16ms by ESPHome main loop
-//  Does ONE I2C operation per call, never blocks
+//  loop() — runs every ~16ms, one I2C op per call
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::loop() {
@@ -319,7 +350,7 @@ void DesfireReaderComponent::loop() {
 
     const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
     if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
-      reset_to_idle_(100);
+      reset_to_idle_(50);
       return;
     }
     state_ = NfcState::DETECT_WAIT_ACK;
@@ -336,7 +367,11 @@ void DesfireReaderComponent::loop() {
     }
     if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
       ESP_LOGD(TAG, "Detect ACK timeout");
-      reset_to_idle_(100);
+      // Likely no card or PN532 busy
+      if (no_card_count_ < 255) no_card_count_++;
+      if (no_card_count_ >= NO_CARD_THRESHOLD && card_present_)
+        clear_card_state_();
+      reset_to_idle_(50);
     }
     return;
   }
@@ -350,6 +385,7 @@ void DesfireReaderComponent::loop() {
       if (resp_len > 0 && resp[0] != 0) {
         // Card detected
         no_card_count_ = 0;
+        consecutive_fails_ = 0;
 
         uint8_t uid_len = 0;
         const uint8_t *uid_ptr = nullptr;
@@ -362,7 +398,7 @@ void DesfireReaderComponent::loop() {
             uid_len = 0;
         }
 
-        // Same card still present
+        // Same card still present — skip re-auth
         if (uid_len > 0 && uid_len == prev_uid_len_ &&
             memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
           reset_to_idle_(COOLDOWN_SUCCESS_MS);
@@ -396,31 +432,19 @@ void DesfireReaderComponent::loop() {
         return;
       }
 
-      // No card
+      // Response received but no card
       if (no_card_count_ < 255) no_card_count_++;
-      if (no_card_count_ >= 3 && card_present_) {
-        card_present_ = false;
-        prev_uid_len_ = 0;
-        publish_auth_(false);
-        publish_result_("");
-        publish_uid_("");
-        ESP_LOGD(TAG, "Card removed");
-      }
+      if (no_card_count_ >= NO_CARD_THRESHOLD && card_present_)
+        clear_card_state_();
       reset_to_idle_(0);
       return;
     }
 
-    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
+    if (millis() - state_entered_at_ > DETECT_TIMEOUT_MS) {
       if (no_card_count_ < 255) no_card_count_++;
-      if (no_card_count_ >= 3 && card_present_) {
-        card_present_ = false;
-        prev_uid_len_ = 0;
-        publish_auth_(false);
-        publish_result_("");
-        publish_uid_("");
-        ESP_LOGD(TAG, "Card removed (timeout)");
-      }
-      reset_to_idle_(100);
+      if (no_card_count_ >= NO_CARD_THRESHOLD && card_present_)
+        clear_card_state_();
+      reset_to_idle_(50);
     }
     return;
   }
@@ -497,7 +521,6 @@ void DesfireReaderComponent::loop() {
         return;
       }
 
-      // Compute auth phase 2
       memcpy(enc_rnd_b_, resp1, 16);
 
       uint8_t rnd_b[16];
@@ -579,7 +602,6 @@ void DesfireReaderComponent::loop() {
         return;
       }
 
-      // Verify mutual auth
       uint8_t rnd_a_expected[16];
       memcpy(rnd_a_expected, rnd_a_ + 1, 15);
       rnd_a_expected[15] = rnd_a_[0];
@@ -606,7 +628,6 @@ void DesfireReaderComponent::loop() {
 
       ESP_LOGI(TAG, "Mutual AES auth verified — card is genuine");
 
-      // Send ReadFile (file 0x01, length 0 = all)
       uint8_t apdu[] = {
           0x90, 0xBD, 0x00, 0x00, 0x07, 0x01,
           0x00, 0x00, 0x00,
@@ -658,20 +679,19 @@ void DesfireReaderComponent::loop() {
       memcpy(raw_file_, resp, resp_len);
       raw_file_len_ = resp_len;
       state_ = NfcState::PUBLISH;
+      // Fall through immediately — no I2C needed for publish
+    } else {
+      if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
+        ESP_LOGE(TAG, "ReadFile read timeout");
+        handle_fail_();
+      }
       return;
     }
-
-    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGE(TAG, "ReadFile read timeout");
-      handle_fail_();
-    }
-    return;
   }
+  // FALLTHROUGH to PUBLISH when read succeeds (no break)
 
   // ─────────────────────────────────────────────
   case NfcState::PUBLISH: {
-    ESP_LOGD(TAG, "ReadFile OK — %d bytes", raw_file_len_);
-
     uint8_t cipher_len = (raw_file_len_ / 16) * 16;
 
     if (cipher_len == 0 || cipher_len > 48) {
