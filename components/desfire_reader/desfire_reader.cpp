@@ -340,11 +340,16 @@ void DesfireReaderComponent::loop() {
   switch (state_) {
 
   // ─────────────────────────────────────────────
-  case NfcState::IDLE: {
-    if (!update_requested_)
-      return;
+   case NfcState::IDLE: {
+    // If cooldown active, don't consume the flag — just wait
     if ((int32_t)(cooldown_until_ - now) > 0)
       return;
+
+    // No update requested? Auto-request one (continuous polling)
+    if (!update_requested_) {
+      update_requested_ = true;
+      return;
+    }
 
     update_requested_ = false;
 
@@ -357,7 +362,6 @@ void DesfireReaderComponent::loop() {
     state_entered_at_ = now;
     return;
   }
-
   // ─────────────────────────────────────────────
   case NfcState::DETECT_WAIT_ACK: {
     if (try_read_ack_()) {
