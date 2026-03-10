@@ -332,7 +332,7 @@ void DesfireReaderComponent::dump_config() {
 
 // ═══════════════════════════════════════════════════════════════
 //  DESFire APDU via PN532 InDataExchange
-// ════════════════════════════════════════════════════���══════════
+// ═══════════════════════════════════════════════════════════════
 
 bool DesfireReaderComponent::desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len,
                                            uint8_t *response, uint8_t resp_cap,
@@ -373,7 +373,7 @@ bool DesfireReaderComponent::desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len
 
 // ═══════════════════════════════════════════════════════════════
 //  DESFire Operations
-// ═══════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════���═════════
 
 bool DesfireReaderComponent::df_select_app_() {
   uint8_t apdu[] = {0x90, 0x5A, 0x00, 0x00, 0x03,
@@ -385,17 +385,16 @@ bool DesfireReaderComponent::df_select_app_() {
   return sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK;
 }
 
-// DESFire legacy AuthenticateAES (0xAA) with full mutual verification.
+// DESFire AuthenticateAES (0xAA) with proper continuous CBC IV chaining.
 //
-// We try all three candidate IVs for decrypting the card's response,
-// since different DESFire versions/implementations may use different
-// CBC IV management strategies:
+// Per NXP AN10833, the CBC IV is continuously chained across all
+// encrypt/decrypt operations during the authentication handshake:
 //
-//   1. IV = token[16..31]  (continuous single IV — NXP AN10833)
-//   2. IV = resp1          (separate send IV from step 1)
-//   3. IV = 0              (fresh IV per message)
-//
-// Whichever matches proves the card knows the key.
+//   1. Decrypt E_k(RndB): IV = 0 (first operation), then IV advances
+//      to enc_rnd_b (the received ciphertext).
+//   2. Encrypt RndA||RndB': IV = enc_rnd_b (last received ciphertext),
+//      chaining through both blocks.
+//   3. Decrypt E_k(RndA'): IV = token[16:31] (last sent ciphertext block).
 
 bool DesfireReaderComponent::df_auth_aes_() {
   // Step 1: AuthenticateAES (INS=0xAA), key number 0
@@ -408,13 +407,18 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16)
     return false;
 
-  // Save E_k(RndB) before decrypting
+  // Save E_k(RndB) — the received ciphertext
   uint8_t enc_rnd_b[16];
   memcpy(enc_rnd_b, resp1, 16);
 
-  // Decrypt E_k(RndB) — single block, IV=0
+  // ── Step 2: Decrypt E_k(RndB) with CBC, IV = 0 ──
+  // CBC decrypt: plaintext = Dec_k(ciphertext) ^ IV
+  // First operation, so IV = 0 → plaintext = Dec_k(enc_rnd_b) ^ 0 = Dec_k(enc_rnd_b)
+  // (Same result as raw decrypt for the first block)
   uint8_t rnd_b[16];
-  aes_dec_block_(app_rk_, resp1, rnd_b);
+  aes_dec_block_(app_rk_, enc_rnd_b, rnd_b);
+  // After this decrypt, the receive-direction IV advances to enc_rnd_b.
+  // The send-direction IV also advances to enc_rnd_b (last received ciphertext).
 
   // Generate RndA
   uint8_t rnd_a[16];
@@ -425,13 +429,19 @@ bool DesfireReaderComponent::df_auth_aes_() {
   memcpy(rnd_b_rot, rnd_b + 1, 15);
   rnd_b_rot[15] = rnd_b[0];
 
-  // Encrypt (RndA || RndB') with AES-CBC, IV=0
+  // ── Step 3: Encrypt RndA || RndB' with AES-CBC, IV = enc_rnd_b ──
   uint8_t token[32];
-  aes_enc_block_(app_rk_, rnd_a, token);
-  uint8_t tmp[16];
+  uint8_t xor_buf[16];
+
+  // Block 1: token[0:15] = Enc_k(RndA ^ enc_rnd_b)
   for (uint8_t i = 0; i < 16; i++)
-    tmp[i] = rnd_b_rot[i] ^ token[i];
-  aes_enc_block_(app_rk_, tmp, token + 16);
+    xor_buf[i] = rnd_a[i] ^ enc_rnd_b[i];
+  aes_enc_block_(app_rk_, xor_buf, token);
+
+  // Block 2: token[16:31] = Enc_k(RndB' ^ token[0:15])
+  for (uint8_t i = 0; i < 16; i++)
+    xor_buf[i] = rnd_b_rot[i] ^ token[i];
+  aes_enc_block_(app_rk_, xor_buf, token + 16);
 
   // Build APDU: [90 AF 00 00 20 <32 bytes> 00]
   uint8_t apdu2[38];
@@ -460,53 +470,36 @@ bool DesfireReaderComponent::df_auth_aes_() {
   memcpy(rnd_a_expected, rnd_a + 1, 15);
   rnd_a_expected[15] = rnd_a[0];
 
-  // Raw decrypt of resp2 (no CBC XOR = same as IV=0)
-  uint8_t raw_dec[16];
-  aes_dec_block_(app_rk_, resp2, raw_dec);
+  // ── Step 4: Decrypt E_k(RndA') with CBC, IV = token[16:31] ──
+  // The last ciphertext block we sent was token[16:31], so that's the IV.
+  uint8_t dec_tmp[16];
+  aes_dec_block_(app_rk_, resp2, dec_tmp);
+  uint8_t rnd_a_received[16];
+  for (uint8_t i = 0; i < 16; i++)
+    rnd_a_received[i] = dec_tmp[i] ^ token[16 + i];
 
-  // Debug dump all values
+  // Debug dump
   log_hex16_("enc_rnd_b  ", enc_rnd_b);
+  log_hex16_("rnd_b      ", rnd_b);
   log_hex16_("rnd_a      ", rnd_a);
   log_hex16_("token[0:15]", token);
   log_hex16_("token[16:] ", token + 16);
   log_hex16_("resp2      ", resp2);
-  log_hex16_("Dec(resp2) ", raw_dec);
+  log_hex16_("Dec(resp2) ", dec_tmp);
+  log_hex16_("decrypted  ", rnd_a_received);
   log_hex16_("expected   ", rnd_a_expected);
 
-  // Try all three candidate IVs
-  struct { const char *name; const uint8_t *iv; } candidates[] = {
-    {"token[16:31]", token + 16},
-    {"enc_rnd_b   ", enc_rnd_b},
-    {"zero        ", nullptr}
-  };
+  // Constant-time compare
+  uint8_t diff = 0;
+  for (uint8_t i = 0; i < 16; i++)
+    diff |= rnd_a_received[i] ^ rnd_a_expected[i];
 
-  for (auto &c : candidates) {
-    uint8_t plain[16];
-    if (c.iv != nullptr) {
-      for (uint8_t i = 0; i < 16; i++)
-        plain[i] = raw_dec[i] ^ c.iv[i];
-    } else {
-      memcpy(plain, raw_dec, 16);
-    }
-
-    uint8_t diff = 0;
-    for (uint8_t i = 0; i < 16; i++)
-      diff |= plain[i] ^ rnd_a_expected[i];
-
-    ESP_LOGD(TAG, "  IV=%s → diff=%d", c.name, diff);
-    if (diff == 0) {
-      ESP_LOGD(TAG, "Mutual auth verified with IV=%s — card is genuine", c.name);
-      return true;
-    }
+  if (diff == 0) {
+    ESP_LOGI(TAG, "Mutual AES auth verified — card is genuine");
+    return true;
   }
 
-  // None matched — dump what XOR would need to be for diagnosis
-  uint8_t needed_iv[16];
-  for (uint8_t i = 0; i < 16; i++)
-    needed_iv[i] = raw_dec[i] ^ rnd_a_expected[i];
-  log_hex16_("needed IV  ", needed_iv);
-
-  ESP_LOGE(TAG, "Mutual auth FAILED — no IV candidate matched");
+  ESP_LOGE(TAG, "Mutual auth FAILED — RndA' mismatch (diff=%d)", diff);
   return false;
 }
 
