@@ -3,15 +3,11 @@
 #include "esphome/core/hal.h"
 #include <string.h>
 
-#ifdef USE_ESP32
-#include <esp_random.h>
-#endif
-
 namespace esphome {
 namespace desfire_reader {
 
-// ═════════════���═════════════════════════════════════════════════
-//  Security helper: zero sensitive memory (not optimised away)
+// ═══════════════════════════════════════════════════════════════
+//  Security helper
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
@@ -20,7 +16,7 @@ void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Raw PN532 I2C frame protocol — NON-BLOCKING
+//  PN532 I2C — non-blocking primitives
 // ═══════════════════════════════════════════════════════════════
 
 bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len) {
@@ -49,24 +45,18 @@ bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len)
   if (this->write(frame, total) != i2c::ERROR_OK)
     return false;
 
-  ack_received_ = false;
-  poll_attempts_ = 0;
   state_entered_at_ = millis();
   return true;
 }
 
-// Non-blocking: try to read ACK once. Returns true if ACK received OK.
-// Returns false if not ready yet or bad ACK.
 bool DesfireReaderComponent::try_read_ack_() {
   uint8_t ack[7];
   if (this->read(ack, 7) != i2c::ERROR_OK || ack[0] != 0x01)
-    return false;  // not ready yet
-
+    return false;
   return (ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
           ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00);
 }
 
-// Non-blocking: try to read response once. Returns true if response received OK.
 bool DesfireReaderComponent::try_read_response_(uint8_t command,
                                                  uint8_t *resp, uint8_t resp_cap,
                                                  uint8_t &resp_len) {
@@ -74,7 +64,7 @@ bool DesfireReaderComponent::try_read_response_(uint8_t command,
   uint8_t buf[PN532_BUF_SIZE];
 
   if (this->read(buf, sizeof(buf)) != i2c::ERROR_OK || buf[0] != 0x01)
-    return false;  // not ready
+    return false;
 
   if (buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0xFF)
     return false;
@@ -110,7 +100,7 @@ bool DesfireReaderComponent::try_read_response_(uint8_t command,
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  DESFire APDU — split into send/receive
+//  DESFire APDU — split send/receive
 // ═══════════════════════════════════════════════════════════════
 
 bool DesfireReaderComponent::send_desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len) {
@@ -206,7 +196,6 @@ void DesfireReaderComponent::handle_fail_() {
   for (uint8_t i = 1; i < consecutive_fails_ && delay_ms < COOLDOWN_FAIL_MAX_MS; i++)
     delay_ms = (delay_ms * 2 > COOLDOWN_FAIL_MAX_MS) ? COOLDOWN_FAIL_MAX_MS : delay_ms * 2;
   ESP_LOGD(TAG, "Fail #%d — cooldown %lu ms", consecutive_fails_, (unsigned long)delay_ms);
-
   publish_auth_(false);
   reset_to_idle_(delay_ms);
 }
@@ -214,14 +203,13 @@ void DesfireReaderComponent::handle_fail_() {
 void DesfireReaderComponent::reset_to_idle_(uint32_t cooldown_ms) {
   state_ = NfcState::IDLE;
   cooldown_until_ = millis() + cooldown_ms;
-  // Clear sensitive auth buffers
   secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
   secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
   secure_zero_((volatile uint8_t *)token_, sizeof(token_));
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Setup — with timeout protection
+//  Setup
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::setup() {
@@ -235,8 +223,7 @@ void DesfireReaderComponent::setup() {
   this->write(wakeup, sizeof(wakeup));
   delay(10);
 
-  // SAMConfiguration — this is the only place we use a short blocking wait
-  // during setup, which is acceptable since it runs once at boot.
+  // SAMConfiguration — brief blocking at boot only
   const uint8_t sam_cmd[] = {0x14, 0x01, 0x14, 0x00};
   if (!this->write_command_(sam_cmd, sizeof(sam_cmd))) {
     ESP_LOGE(TAG, "PN532 not responding — check I2C wiring (addr 0x%02X)",
@@ -245,40 +232,34 @@ void DesfireReaderComponent::setup() {
     return;
   }
 
-  // Brief blocking wait for SAM response only — with timeout
-  uint8_t sam_resp[8];
-  uint8_t sam_len = 0;
+  // Wait for ACK (max 50ms)
   uint32_t start = millis();
-  bool sam_ok = false;
-
-  // Wait for ACK first (max 50ms)
+  bool ack_ok = false;
   while (millis() - start < 50) {
-    if (try_read_ack_()) {
-      sam_ok = true;
-      break;
-    }
+    if (try_read_ack_()) { ack_ok = true; break; }
     delay(2);
   }
-
-  if (sam_ok) {
-    // Now wait for response (max 100ms)
-    start = millis();
-    while (millis() - start < 100) {
-      if (try_read_response_(0x14, sam_resp, sizeof(sam_resp), sam_len))
-        break;
-      delay(3);
-    }
-  } else {
+  if (!ack_ok) {
     ESP_LOGE(TAG, "PN532 SAM ACK timeout — check wiring");
     this->mark_failed();
     return;
   }
 
-  // RFConfiguration MaxRetries — also brief blocking at setup
+  // Wait for SAM response (max 100ms)
+  uint8_t sam_resp[8];
+  uint8_t sam_len = 0;
+  start = millis();
+  while (millis() - start < 100) {
+    if (try_read_response_(0x14, sam_resp, sizeof(sam_resp), sam_len))
+      break;
+    delay(3);
+  }
+
+  // RFConfiguration MaxRetries
   const uint8_t rf_cfg[] = {0x12, 0x05, 0xFF, 0x01, 0x02};
   if (this->write_command_(rf_cfg, sizeof(rf_cfg))) {
     start = millis();
-    bool ack_ok = false;
+    ack_ok = false;
     while (millis() - start < 50) {
       if (try_read_ack_()) { ack_ok = true; break; }
       delay(2);
@@ -303,46 +284,57 @@ void DesfireReaderComponent::setup() {
 
   state_ = NfcState::IDLE;
   cooldown_until_ = 0;
-  ESP_LOGCONFIG(TAG, "PN532 initialized (MaxRetries=2).");
+  update_requested_ = false;
+  ESP_LOGCONFIG(TAG, "PN532 initialized.");
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Update — NON-BLOCKING state machine
-//  Each call does ONE small step, then returns to the main loop.
+//  update() — called at update_interval, just flags "time to poll"
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
+  // Only request a new detection if we're idle
+  if (state_ == NfcState::IDLE)
+    update_requested_ = true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  loop() — called every ~16ms by ESPHome main loop
+//  Does ONE I2C operation per call, never blocks
+// ═══════════════════════════════════════════════════════════════
+
+void DesfireReaderComponent::loop() {
   uint32_t now = millis();
 
   switch (state_) {
 
   // ─────────────────────────────────────────────
   case NfcState::IDLE: {
+    if (!update_requested_)
+      return;
     if ((int32_t)(cooldown_until_ - now) > 0)
-      return;  // still cooling down
+      return;
 
-    // Send card detection command
+    update_requested_ = false;
+
     const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
     if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
       reset_to_idle_(100);
       return;
     }
-    state_ = NfcState::DETECT_SEND;
+    state_ = NfcState::DETECT_WAIT_ACK;
     state_entered_at_ = now;
     return;
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::DETECT_SEND: {
-    // Wait for ACK
+  case NfcState::DETECT_WAIT_ACK: {
     if (try_read_ack_()) {
-      state_ = NfcState::DETECT_READ;
+      state_ = NfcState::DETECT_WAIT_RESP;
       state_entered_at_ = millis();
-      poll_attempts_ = 0;
       return;
     }
-    // Timeout check
-    if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
       ESP_LOGD(TAG, "Detect ACK timeout");
       reset_to_idle_(100);
     }
@@ -350,13 +342,13 @@ void DesfireReaderComponent::update() {
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::DETECT_READ: {
+  case NfcState::DETECT_WAIT_RESP: {
     uint8_t resp[48];
     uint8_t resp_len;
 
     if (try_read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp), resp_len)) {
       if (resp_len > 0 && resp[0] != 0) {
-        // Card detected!
+        // Card detected
         no_card_count_ = 0;
 
         uint8_t uid_len = 0;
@@ -370,14 +362,14 @@ void DesfireReaderComponent::update() {
             uid_len = 0;
         }
 
-        // Same card still present — skip re-auth
+        // Same card still present
         if (uid_len > 0 && uid_len == prev_uid_len_ &&
             memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
           reset_to_idle_(COOLDOWN_SUCCESS_MS);
           return;
         }
 
-        // New card — store UID
+        // New card
         current_uid_len_ = 0;
         current_uid_str_[0] = '\0';
         if (uid_len > 0 && uid_ptr != nullptr) {
@@ -399,12 +391,12 @@ void DesfireReaderComponent::update() {
           handle_fail_();
           return;
         }
-        state_ = NfcState::SELECT_SEND;
+        state_ = NfcState::SELECT_WAIT_ACK;
         state_entered_at_ = millis();
         return;
       }
 
-      // No card in response
+      // No card
       if (no_card_count_ < 255) no_card_count_++;
       if (no_card_count_ >= 3 && card_present_) {
         card_present_ = false;
@@ -414,14 +406,11 @@ void DesfireReaderComponent::update() {
         publish_uid_("");
         ESP_LOGD(TAG, "Card removed");
       }
-      reset_to_idle_(100);
+      reset_to_idle_(0);
       return;
     }
 
-    // Not ready yet — check timeout
-    poll_attempts_++;
-    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
-      // No card
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
       if (no_card_count_ < 255) no_card_count_++;
       if (no_card_count_ >= 3 && card_present_) {
         card_present_ = false;
@@ -437,40 +426,35 @@ void DesfireReaderComponent::update() {
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::SELECT_SEND: {
-    if (!ack_received_) {
-      if (try_read_ack_()) {
-        ack_received_ = true;
-        poll_attempts_ = 0;
-        state_entered_at_ = millis();
-        state_ = NfcState::SELECT_READ;
-        return;
-      }
-      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
-        ESP_LOGE(TAG, "SelectApp ACK timeout");
-        handle_fail_();
-      }
+  case NfcState::SELECT_WAIT_ACK: {
+    if (try_read_ack_()) {
+      state_ = NfcState::SELECT_WAIT_RESP;
+      state_entered_at_ = millis();
       return;
+    }
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
+      ESP_LOGE(TAG, "SelectApp ACK timeout");
+      handle_fail_();
     }
     return;
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::SELECT_READ: {
+  case NfcState::SELECT_WAIT_RESP: {
     uint8_t resp[8];
     uint8_t resp_len, sw1, sw2;
 
     if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
       if (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK) {
         ESP_LOGD(TAG, "SelectApp OK");
-        // Send AES auth phase 1
+
         uint8_t apdu1[] = {0x90, 0xAA, 0x00, 0x00, 0x01, 0x00, 0x00};
         if (!send_desfire_apdu_(apdu1, sizeof(apdu1))) {
           ESP_LOGE(TAG, "Auth1 send failed");
           handle_fail_();
           return;
         }
-        state_ = NfcState::AUTH1_SEND;
+        state_ = NfcState::AUTH1_WAIT_ACK;
         state_entered_at_ = millis();
         return;
       }
@@ -480,8 +464,7 @@ void DesfireReaderComponent::update() {
       return;
     }
 
-    poll_attempts_++;
-    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
       ESP_LOGE(TAG, "SelectApp read timeout");
       handle_fail_();
     }
@@ -489,26 +472,21 @@ void DesfireReaderComponent::update() {
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::AUTH1_SEND: {
-    if (!ack_received_) {
-      if (try_read_ack_()) {
-        ack_received_ = true;
-        poll_attempts_ = 0;
-        state_entered_at_ = millis();
-        state_ = NfcState::AUTH1_READ;
-        return;
-      }
-      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
-        ESP_LOGE(TAG, "Auth1 ACK timeout");
-        handle_fail_();
-      }
+  case NfcState::AUTH1_WAIT_ACK: {
+    if (try_read_ack_()) {
+      state_ = NfcState::AUTH1_WAIT_RESP;
+      state_entered_at_ = millis();
       return;
+    }
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
+      ESP_LOGE(TAG, "Auth1 ACK timeout");
+      handle_fail_();
     }
     return;
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::AUTH1_READ: {
+  case NfcState::AUTH1_WAIT_RESP: {
     uint8_t resp1[32];
     uint8_t resp1_len, sw1, sw2;
 
@@ -519,7 +497,7 @@ void DesfireReaderComponent::update() {
         return;
       }
 
-      // Compute auth phase 2 token
+      // Compute auth phase 2
       memcpy(enc_rnd_b_, resp1, 16);
 
       uint8_t rnd_b[16];
@@ -540,7 +518,6 @@ void DesfireReaderComponent::update() {
         xor_buf[i] = rnd_b_rot[i] ^ token_[i];
       aes_enc_block_(app_rk_, xor_buf, token_ + 16);
 
-      // Send auth phase 2
       uint8_t apdu2[38];
       apdu2[0] = 0x90;
       apdu2[1] = 0xAF;
@@ -559,13 +536,12 @@ void DesfireReaderComponent::update() {
         handle_fail_();
         return;
       }
-      state_ = NfcState::AUTH2_SEND;
+      state_ = NfcState::AUTH2_WAIT_ACK;
       state_entered_at_ = millis();
       return;
     }
 
-    poll_attempts_++;
-    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
       ESP_LOGE(TAG, "Auth1 read timeout");
       handle_fail_();
     }
@@ -573,26 +549,21 @@ void DesfireReaderComponent::update() {
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::AUTH2_SEND: {
-    if (!ack_received_) {
-      if (try_read_ack_()) {
-        ack_received_ = true;
-        poll_attempts_ = 0;
-        state_entered_at_ = millis();
-        state_ = NfcState::AUTH2_READ;
-        return;
-      }
-      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
-        ESP_LOGE(TAG, "Auth2 ACK timeout");
-        handle_fail_();
-      }
+  case NfcState::AUTH2_WAIT_ACK: {
+    if (try_read_ack_()) {
+      state_ = NfcState::AUTH2_WAIT_RESP;
+      state_entered_at_ = millis();
       return;
+    }
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
+      ESP_LOGE(TAG, "Auth2 ACK timeout");
+      handle_fail_();
     }
     return;
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::AUTH2_READ: {
+  case NfcState::AUTH2_WAIT_RESP: {
     uint8_t resp2[32];
     uint8_t resp2_len, sw1, sw2;
 
@@ -603,7 +574,7 @@ void DesfireReaderComponent::update() {
         return;
       }
       if (resp2_len != 16) {
-        ESP_LOGE(TAG, "Auth response wrong length (%d, expected 16)", resp2_len);
+        ESP_LOGE(TAG, "Auth response wrong length (%d)", resp2_len);
         handle_fail_();
         return;
       }
@@ -635,7 +606,7 @@ void DesfireReaderComponent::update() {
 
       ESP_LOGI(TAG, "Mutual AES auth verified — card is genuine");
 
-      // Send ReadFile
+      // Send ReadFile (file 0x01, length 0 = all)
       uint8_t apdu[] = {
           0x90, 0xBD, 0x00, 0x00, 0x07, 0x01,
           0x00, 0x00, 0x00,
@@ -646,13 +617,12 @@ void DesfireReaderComponent::update() {
         handle_fail_();
         return;
       }
-      state_ = NfcState::READ_SEND;
+      state_ = NfcState::READ_WAIT_ACK;
       state_entered_at_ = millis();
       return;
     }
 
-    poll_attempts_++;
-    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
       ESP_LOGE(TAG, "Auth2 read timeout");
       handle_fail_();
     }
@@ -660,26 +630,21 @@ void DesfireReaderComponent::update() {
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::READ_SEND: {
-    if (!ack_received_) {
-      if (try_read_ack_()) {
-        ack_received_ = true;
-        poll_attempts_ = 0;
-        state_entered_at_ = millis();
-        state_ = NfcState::READ_READ;
-        return;
-      }
-      if (millis() - state_entered_at_ > READ_TIMEOUT_MS) {
-        ESP_LOGE(TAG, "ReadFile ACK timeout");
-        handle_fail_();
-      }
+  case NfcState::READ_WAIT_ACK: {
+    if (try_read_ack_()) {
+      state_ = NfcState::READ_WAIT_RESP;
+      state_entered_at_ = millis();
       return;
+    }
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
+      ESP_LOGE(TAG, "ReadFile ACK timeout");
+      handle_fail_();
     }
     return;
   }
 
   // ─────────────────────────────────────────────
-  case NfcState::READ_READ: {
+  case NfcState::READ_WAIT_RESP: {
     uint8_t resp[48];
     uint8_t resp_len, sw1, sw2;
 
@@ -696,8 +661,7 @@ void DesfireReaderComponent::update() {
       return;
     }
 
-    poll_attempts_++;
-    if (millis() - state_entered_at_ > READ_TIMEOUT_MS || poll_attempts_ > MAX_READ_POLLS) {
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
       ESP_LOGE(TAG, "ReadFile read timeout");
       handle_fail_();
     }
@@ -729,7 +693,6 @@ void DesfireReaderComponent::update() {
       return;
     }
 
-    // Extract printable result
     char result[49];
     uint8_t rlen = 0;
     for (uint8_t i = 0; i < cipher_len && i < 48 &&
@@ -741,7 +704,6 @@ void DesfireReaderComponent::update() {
 
     ESP_LOGI(TAG, "Auth + read OK (%d bytes)", rlen);
 
-    // Publish
     if (current_uid_str_[0] != '\0')
       publish_uid_(current_uid_str_);
     publish_auth_(true);
@@ -760,7 +722,7 @@ void DesfireReaderComponent::update() {
 void DesfireReaderComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "DESFire Reader:");
   ESP_LOGCONFIG(TAG, "  App ID: %02X:%02X:%02X", app_id_[0], app_id_[1], app_id_[2]);
-  ESP_LOGCONFIG(TAG, "  Mode: non-blocking state machine");
+  ESP_LOGCONFIG(TAG, "  Mode: non-blocking state machine (loop)");
   LOG_I2C_DEVICE(this);
 }
 
@@ -885,7 +847,7 @@ void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
       break;
     for (int c = 0; c < 4; c++) {
       uint8_t *col = s + c * 4, a = col[0], b = col[1], cc = col[2], d = col[3];
-            col[0] = mul_(a, 0xe) ^ mul_(b, 0xb) ^ mul_(cc, 0xd) ^ mul_(d, 0x9);
+      col[0] = mul_(a, 0xe) ^ mul_(b, 0xb) ^ mul_(cc, 0xd) ^ mul_(d, 0x9);
       col[1] = mul_(a, 0x9) ^ mul_(b, 0xe) ^ mul_(cc, 0xb) ^ mul_(d, 0xd);
       col[2] = mul_(a, 0xd) ^ mul_(b, 0x9) ^ mul_(cc, 0xe) ^ mul_(d, 0xb);
       col[3] = mul_(a, 0xb) ^ mul_(b, 0xd) ^ mul_(cc, 0x9) ^ mul_(d, 0xe);
