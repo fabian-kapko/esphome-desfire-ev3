@@ -277,18 +277,24 @@ void DesfireReaderComponent::update() {
 
       ESP_LOGD(TAG, "ReadFile OK — %d bytes", raw_len);
 
-      // The file contains AES-CBC encrypted data (IV=0, encrypted by provisioner).
-      // Decrypt the entire contents with data_key.
-      if (raw_len == 0 || raw_len % 16 != 0 || raw_len > 48) {
-        ESP_LOGE(TAG, "Bad file length (%d)", raw_len);
+      // The card may append an 8-byte CMAC after legacy auth.
+      // The actual ciphertext is always a multiple of 16, so round down.
+      uint8_t cipher_len = (raw_len / 16) * 16;
+
+      if (cipher_len == 0 || cipher_len > 48) {
+        ESP_LOGE(TAG, "Bad cipher length (%d from %d raw bytes)", cipher_len, raw_len);
         publish_auth_(false);
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
         return;
       }
 
+      if (raw_len != cipher_len) {
+        ESP_LOGD(TAG, "Stripped %d trailing bytes (CMAC)", raw_len - cipher_len);
+      }
+
       uint8_t decrypted[48];
       uint8_t zero_iv[16] = {0};
-      if (!aes_cbc_decrypt_(raw, raw_len, zero_iv, decrypted)) {
+      if (!aes_cbc_decrypt_(raw, cipher_len, zero_iv, decrypted)) {
         ESP_LOGE(TAG, "AES decrypt FAILED");
         publish_auth_(false);
         cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
@@ -297,7 +303,7 @@ void DesfireReaderComponent::update() {
 
       char result[17];
       uint8_t rlen = 0;
-      for (uint8_t i = 0; i < raw_len && i < 16 &&
+      for (uint8_t i = 0; i < cipher_len && i < 16 &&
            decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
         result[rlen++] = (char)decrypted[i];
       result[rlen] = '\0';
