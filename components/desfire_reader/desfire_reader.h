@@ -22,7 +22,8 @@ static const uint8_t PN532_BUF_SIZE = 64;
 
 // Cooldowns (ms)
 static const uint16_t COOLDOWN_SUCCESS_MS = 500;
-static const uint16_t COOLDOWN_FAIL_MS    = 200;
+static const uint16_t COOLDOWN_FAIL_BASE_MS = 200;
+static const uint32_t COOLDOWN_FAIL_MAX_MS  = 30000;
 
 // Forward declarations of standalone AES helpers (defined in .cpp)
 void aes_key_exp_(const uint8_t *key, uint8_t *rk);
@@ -43,9 +44,11 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
 
   // Overloads for vector (Python codegen sends std::vector)
   void set_app_key(const std::vector<uint8_t> &key) {
+    if (key.size() < 16) return;
     for (int i = 0; i < 16; i++) app_key_[i] = key[i];
   }
   void set_data_key(const std::vector<uint8_t> &key) {
+    if (key.size() < 16) return;
     for (int i = 0; i < 16; i++) data_key_[i] = key[i];
   }
 
@@ -60,8 +63,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
  protected:
   // ── PN532 I2C frame layer ──
   bool write_command_(const uint8_t *cmd, uint8_t cmd_len);
-  // max_polls × 3 ms = worst-case blocking time for this call.
-  // Use ~20 for detect (~60 ms), ~80 for DESFire APDU (~240 ms).
   bool read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
                       uint8_t &resp_len, uint8_t max_polls = 80);
 
@@ -74,8 +75,12 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   bool df_read_file_(uint8_t file_id, uint8_t length,
                      uint8_t *out, uint8_t &out_len);
 
-  bool aes_cbc_decrypt_(const uint8_t *in, uint8_t len, uint8_t *out);
+  bool aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
+                        const uint8_t *iv, uint8_t *out);
   void random_bytes_(uint8_t *buf, uint8_t len);
+
+  // ── Security helpers ──
+  static void secure_zero_(volatile uint8_t *buf, uint8_t len);
 
   // ── Publish helpers (only when value changes) ──
   void format_uid_(const uint8_t *uid_bytes, uint8_t uid_len, char *out);
@@ -97,15 +102,16 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
 
   // ── Publish-only-when-changed cache ──
   char     last_uid_[24]{};
-  char     last_result_[18]{};
+  char     last_result_[50]{};       // Fix #13: expanded from 18 to 50
   bool     last_auth_{false};
 
   // ── Cooldown + UID dedup ──
   uint32_t cooldown_until_{0};
   uint8_t  prev_uid_[7]{};
   uint8_t  prev_uid_len_{0};
-  bool     card_present_{false};  // true while card data is published
-  uint8_t  no_card_count_{0};    // consecutive no-card detects (debounce)
+  bool     card_present_{false};
+  uint8_t  no_card_count_{0};
+  uint8_t  consecutive_fails_{0};    // Fix #7: exponential backoff counter
 };
 
 }  // namespace desfire_reader

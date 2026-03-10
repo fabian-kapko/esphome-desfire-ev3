@@ -3,8 +3,21 @@
 #include "esphome/core/hal.h"
 #include <string.h>
 
+#ifdef USE_ESP32
+#include <esp_random.h>
+#endif
+
 namespace esphome {
 namespace desfire_reader {
+
+// ═══════════════════════════════════════════════════════════════
+//  Security helper: zero sensitive memory (not optimised away)
+// ═══════════════════════════════════════════════════════════════
+
+void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
+  for (uint8_t i = 0; i < len; i++)
+    buf[i] = 0;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  Raw PN532 I2C frame protocol
@@ -12,7 +25,7 @@ namespace desfire_reader {
 
 bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len) {
   uint8_t frame[PN532_BUF_SIZE];
-  uint8_t len = cmd_len + 1;  // +1 for TFI
+  uint8_t len = cmd_len + 1;
   uint8_t total = 6 + cmd_len + 2;
 
   if (total > sizeof(frame))
@@ -23,22 +36,21 @@ bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len)
     dcs += cmd[i];
   dcs = (uint8_t)(0x100u - dcs);
 
-  frame[0] = 0x00;  // PREAMBLE
-  frame[1] = 0x00;  // START CODE
+  frame[0] = 0x00;
+  frame[1] = 0x00;
   frame[2] = 0xFF;
   frame[3] = len;
-  frame[4] = (uint8_t)(0x100u - len);  // LCS
-  frame[5] = 0xD4;  // TFI
+  frame[4] = (uint8_t)(0x100u - len);
+  frame[5] = 0xD4;
   memcpy(frame + 6, cmd, cmd_len);
   frame[6 + cmd_len] = dcs;
-  frame[7 + cmd_len] = 0x00;  // POSTAMBLE
+  frame[7 + cmd_len] = 0x00;
 
   if (this->write(frame, total) != i2c::ERROR_OK)
     return false;
 
   delay(2);
 
-  // Poll for ACK: 1 status + 6 ACK frame bytes.
   for (uint8_t retry = 0; retry < 15; retry++) {
     uint8_t ack[7];
     if (this->read(ack, 7) == i2c::ERROR_OK && ack[0] == 0x01) {
@@ -59,24 +71,17 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
 
   for (uint8_t poll = 0; poll < max_polls; poll++) {
     if (this->read(buf, sizeof(buf)) != i2c::ERROR_OK || buf[0] != 0x01) {
-      // 3 ms is enough at 400 kHz I2C — a 64-byte read takes ~1.3 ms,
-      // so this gives the PN532 a brief processing window without
-      // wasting time.  The yield() calls between DESFire steps handle
-      // WiFi stack breathing.
       delay(3);
       continue;
     }
 
-    // Validate preamble + start code
     if (buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0xFF)
       return false;
 
-    // Validate LEN / LCS
     uint8_t frame_len = buf[4];
     if ((uint8_t)(frame_len + buf[5]) != 0)
       return false;
 
-    // Validate TFI + echoed command
     if (buf[6] != 0xD5 || buf[7] != (uint8_t)(command + 1))
       return false;
 
@@ -84,11 +89,9 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
       return false;
     uint8_t payload_len = frame_len - 2;
 
-    // Bounds: payload + DCS + postamble must fit in buf
     if ((uint16_t)(10 + payload_len) > sizeof(buf))
       return false;
 
-    // Validate DCS
     uint8_t dcs_sum = 0;
     for (uint8_t i = 0; i < frame_len; i++)
       dcs_sum += buf[6 + i];
@@ -96,11 +99,9 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
     if (dcs_sum != 0)
       return false;
 
-    // Validate postamble
     if (buf[7 + frame_len] != 0x00)
       return false;
 
-    // Copy payload
     uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
     memcpy(resp, buf + 8, copy_len);
     resp_len = copy_len;
@@ -110,7 +111,7 @@ bool DesfireReaderComponent::read_response_(uint8_t command,
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Publish helpers — only fire when the value actually changes
+//  Publish helpers
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::format_uid_(const uint8_t *uid_bytes,
@@ -127,8 +128,7 @@ void DesfireReaderComponent::format_uid_(const uint8_t *uid_bytes,
 }
 
 void DesfireReaderComponent::publish_uid_(const char *uid_str) {
-  if (!uid_sensor_)
-    return;
+  if (!uid_sensor_) return;
   if (strcmp(uid_str, last_uid_) != 0) {
     size_t len = strlen(uid_str);
     if (len >= sizeof(last_uid_)) len = sizeof(last_uid_) - 1;
@@ -139,8 +139,7 @@ void DesfireReaderComponent::publish_uid_(const char *uid_str) {
 }
 
 void DesfireReaderComponent::publish_auth_(bool state) {
-  if (!auth_sensor_)
-    return;
+  if (!auth_sensor_) return;
   if (state != last_auth_) {
     last_auth_ = state;
     auth_sensor_->publish_state(state);
@@ -148,8 +147,7 @@ void DesfireReaderComponent::publish_auth_(bool state) {
 }
 
 void DesfireReaderComponent::publish_result_(const char *str) {
-  if (!result_sensor_)
-    return;
+  if (!result_sensor_) return;
   if (strcmp(str, last_result_) != 0) {
     size_t len = strlen(str);
     if (len >= sizeof(last_result_)) len = sizeof(last_result_) - 1;
@@ -165,18 +163,15 @@ void DesfireReaderComponent::publish_result_(const char *str) {
 
 void DesfireReaderComponent::setup() {
   ESP_LOGCONFIG(TAG, "DESFire reader setup...");
-  randomSeed(analogRead(A0) ^ micros());
   aes_key_exp_(app_key_, app_rk_);
   aes_key_exp_(data_key_, data_rk_);
 
-  // Wake PN532 from low-power state.
   static const uint8_t wakeup[] = {
       0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   this->write(wakeup, sizeof(wakeup));
   delay(10);
 
-  // SAMConfiguration: normal mode, timeout=0x14, IRQ off
   const uint8_t sam_cmd[] = {0x14, 0x01, 0x14, 0x00};
   if (!this->write_command_(sam_cmd, sizeof(sam_cmd))) {
     ESP_LOGE(TAG, "PN532 not responding — check I2C wiring (addr 0x%02X)",
@@ -188,11 +183,6 @@ void DesfireReaderComponent::setup() {
   uint8_t sam_len;
   this->read_response_(0x14, sam_resp, sizeof(sam_resp), sam_len, 30);
 
-  // RFConfiguration: set MxRtyPassiveActivation to 2.
-  // This limits InListPassiveTarget to ~2 RF poll cycles before giving up,
-  // so an empty-field detect returns in ~30-50 ms instead of ~500+ ms.
-  // Format: cmd=0x12, CfgItem=0x05, MxRtyATR=0xFF, MxRtyPSL=0x01,
-  //         MxRtyPassiveActivation=0x02
   const uint8_t rf_cfg[] = {0x12, 0x05, 0xFF, 0x01, 0x02};
   if (this->write_command_(rf_cfg, sizeof(rf_cfg))) {
     uint8_t rf_resp[4];
@@ -209,30 +199,26 @@ void DesfireReaderComponent::setup() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Update — cooldown + UID dedup, no card-removed scanning
+//  Update
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::update() {
-  // ── Cooldown gate: skip immediately if still in cooldown ──
   uint32_t now = millis();
   if ((int32_t)(cooldown_until_ - now) > 0)
     return;
 
-  // ── Detect card (short timeout — PN532 MaxRetries is low) ──
   const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
   bool detected = false;
 
   if (this->write_command_(detect_cmd, sizeof(detect_cmd))) {
     uint8_t resp[48];
     uint8_t resp_len;
-    // 20 polls × 3 ms = 60 ms max wait
     if (this->read_response_(PN532_CMD_IN_LIST_PASSIVE, resp, sizeof(resp),
                              resp_len, 20) &&
         resp_len > 0 && resp[0] != 0) {
       detected = true;
       no_card_count_ = 0;
 
-      // ── Parse UID ──
       uint8_t uid_len = 0;
       const uint8_t *uid_ptr = nullptr;
       if (resp_len >= 7) {
@@ -244,14 +230,12 @@ void DesfireReaderComponent::update() {
           uid_len = 0;
       }
 
-      // ── Same card still on reader? Skip workflow, extend cooldown. ──
       if (uid_len > 0 && uid_len == prev_uid_len_ &&
           memcmp(uid_ptr, prev_uid_, uid_len) == 0) {
         cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
         return;
       }
 
-      // ── New card: cache UID, publish, run DESFire workflow ──
       if (uid_len > 0 && uid_ptr != nullptr) {
         memcpy(prev_uid_, uid_ptr, uid_len);
         prev_uid_len_ = uid_len;
@@ -265,67 +249,100 @@ void DesfireReaderComponent::update() {
 
       ESP_LOGI(TAG, "New card — starting DESFire workflow");
 
+      // ── Fix #7: compute fail cooldown with exponential backoff ──
+      auto fail_cooldown = [this]() -> uint32_t {
+        if (consecutive_fails_ < 255) consecutive_fails_++;
+        uint32_t delay_ms = COOLDOWN_FAIL_BASE_MS;
+        for (uint8_t i = 1; i < consecutive_fails_ && delay_ms < COOLDOWN_FAIL_MAX_MS; i++)
+          delay_ms = (delay_ms * 2 > COOLDOWN_FAIL_MAX_MS) ? COOLDOWN_FAIL_MAX_MS : delay_ms * 2;
+        ESP_LOGD(TAG, "Fail #%d — cooldown %lu ms", consecutive_fails_, (unsigned long)delay_ms);
+        return delay_ms;
+      };
+
       if (!df_select_app_()) {
         ESP_LOGE(TAG, "SelectApp FAILED — app %02X%02X%02X not on card?",
                  app_id_[0], app_id_[1], app_id_[2]);
         publish_auth_(false);
-        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        cooldown_until_ = millis() + fail_cooldown();
         return;
       }
-      yield();  // let WiFi/mDNS run
+      yield();
 
       if (!df_auth_aes_()) {
         ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
         publish_auth_(false);
-        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        cooldown_until_ = millis() + fail_cooldown();
         return;
       }
-      yield();  // let WiFi/mDNS run
+      yield();
 
-      uint8_t raw[32];
+      // ── Read file (length=0 means "read entire file" in DESFire) ──
+      uint8_t raw[48];
       uint8_t raw_len;
-      if (!df_read_file_(0x01, 16, raw, raw_len)) {
+      if (!df_read_file_(0x01, 0, raw, raw_len)) {
         ESP_LOGE(TAG, "ReadFile FAILED");
         publish_auth_(false);
-        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        cooldown_until_ = millis() + fail_cooldown();
         return;
       }
 
-      if (raw_len < 16) {
-        ESP_LOGE(TAG, "Data too short (%d)", raw_len);
+      ESP_LOGD(TAG, "ReadFile OK — %d bytes", raw_len);
+
+      // The card may append an 8-byte CMAC after legacy auth.
+      // The actual ciphertext is always a multiple of 16, so round down.
+      uint8_t cipher_len = (raw_len / 16) * 16;
+
+      if (cipher_len == 0 || cipher_len > 48) {
+        ESP_LOGE(TAG, "Bad cipher length (%d from %d raw bytes)", cipher_len, raw_len);
         publish_auth_(false);
-        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        cooldown_until_ = millis() + fail_cooldown();
         return;
       }
 
-      uint8_t decrypted[16];
-      if (!aes_cbc_decrypt_(raw, 16, decrypted)) {
+      if (raw_len != cipher_len) {
+        ESP_LOGD(TAG, "Stripped %d trailing bytes (CMAC)", raw_len - cipher_len);
+      }
+
+      uint8_t decrypted[48];
+      uint8_t zero_iv[16] = {0};
+      if (!aes_cbc_decrypt_(raw, cipher_len, zero_iv, decrypted)) {
         ESP_LOGE(TAG, "AES decrypt FAILED");
+        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));  // Fix #4
         publish_auth_(false);
-        cooldown_until_ = millis() + COOLDOWN_FAIL_MS;
+        cooldown_until_ = millis() + fail_cooldown();
         return;
       }
 
-      // Extract printable ASCII
-      char result[17];
+      // Fix #13: expanded result buffer to support up to 48 printable chars (3 AES blocks)
+      char result[49];
       uint8_t rlen = 0;
-      for (uint8_t i = 0; i < 16 && decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
+      for (uint8_t i = 0; i < cipher_len && i < 48 &&
+           decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
         result[rlen++] = (char)decrypted[i];
       result[rlen] = '\0';
 
-      ESP_LOGI(TAG, "SUCCESS — '%s'", result);
+      // Fix #4: zero decrypted plaintext from stack
+      secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+
+      // Fix #3: don't log the decrypted value — only log byte count
+      ESP_LOGI(TAG, "Auth + read OK (%d bytes)", rlen);
+
       publish_auth_(true);
       publish_result_(result);
+
+      // Fix #4: zero result from stack after publishing
+      secure_zero_((volatile uint8_t *)result, sizeof(result));
+
+      // Fix #7: reset fail counter on success
+      consecutive_fails_ = 0;
+
       cooldown_until_ = millis() + COOLDOWN_SUCCESS_MS;
       return;
     }
   }
 
-  // ── No card detected — debounce before clearing sensors ──
   if (!detected) {
     if (no_card_count_ < 255) no_card_count_++;
-    // Require 3 consecutive misses before declaring card gone.
-    // At ~60 ms per detect attempt, this is ~180 ms debounce.
     if (no_card_count_ >= 3 && card_present_) {
       card_present_ = false;
       prev_uid_len_ = 0;
@@ -364,7 +381,6 @@ bool DesfireReaderComponent::desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len
 
   uint8_t raw[PN532_BUF_SIZE];
   uint8_t raw_len;
-  // DESFire card crypto can take a moment — 80 polls × 3 ms = 240 ms
   if (!this->read_response_(PN532_CMD_IN_DATA_EXCHANGE, raw, sizeof(raw),
                             raw_len, 80))
     return false;
@@ -399,6 +415,17 @@ bool DesfireReaderComponent::df_select_app_() {
   return sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK;
 }
 
+// DESFire AuthenticateAES (0xAA) with proper continuous CBC IV chaining.
+//
+// Per NXP AN10833, the CBC IV is continuously chained across all
+// encrypt/decrypt operations during the authentication handshake:
+//
+//   1. Decrypt E_k(RndB): IV = 0 (first operation), then IV advances
+//      to enc_rnd_b (the received ciphertext).
+//   2. Encrypt RndA||RndB': IV = enc_rnd_b (last received ciphertext),
+//      chaining through both blocks.
+//   3. Decrypt E_k(RndA'): IV = token[16:31] (last sent ciphertext block).
+
 bool DesfireReaderComponent::df_auth_aes_() {
   // Step 1: AuthenticateAES (INS=0xAA), key number 0
   uint8_t apdu1[] = {0x90, 0xAA, 0x00, 0x00, 0x01, 0x00, 0x00};
@@ -410,28 +437,36 @@ bool DesfireReaderComponent::df_auth_aes_() {
   if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16)
     return false;
 
-  // Decrypt encrypted RndB (IV=0, so decrypt is just a single block op)
+  // Save E_k(RndB) — the received ciphertext
+  uint8_t enc_rnd_b[16];
+  memcpy(enc_rnd_b, resp1, 16);
+
+  // ── Step 2: Decrypt E_k(RndB) with CBC, IV = 0 ──
   uint8_t rnd_b[16];
-  aes_dec_block_(app_rk_, resp1, rnd_b);
+  aes_dec_block_(app_rk_, enc_rnd_b, rnd_b);
 
   // Generate RndA
   uint8_t rnd_a[16];
   random_bytes_(rnd_a, 16);
 
-  // Rotate RndB left by 1 byte
+  // Rotate RndB left by 1 byte → RndB'
   uint8_t rnd_b_rot[16];
   memcpy(rnd_b_rot, rnd_b + 1, 15);
   rnd_b_rot[15] = rnd_b[0];
 
-  // Encrypt (RndA || RndB_rot) with AES-CBC, IV=0
-  // Block 1: encrypt(RndA XOR 0) = encrypt(RndA)
+  // ── Step 3: Encrypt RndA || RndB' with AES-CBC, IV = enc_rnd_b ──
   uint8_t token[32];
-  aes_enc_block_(app_rk_, rnd_a, token);
-  // Block 2: encrypt(RndB_rot XOR ciphertext_of_block1)
-  uint8_t tmp[16];
+  uint8_t xor_buf[16];
+
+  // Block 1: token[0:15] = Enc_k(RndA ^ enc_rnd_b)
   for (uint8_t i = 0; i < 16; i++)
-    tmp[i] = rnd_b_rot[i] ^ token[i];
-  aes_enc_block_(app_rk_, tmp, token + 16);
+    xor_buf[i] = rnd_a[i] ^ enc_rnd_b[i];
+  aes_enc_block_(app_rk_, xor_buf, token);
+
+  // Block 2: token[16:31] = Enc_k(RndB' ^ token[0:15])
+  for (uint8_t i = 0; i < 16; i++)
+    xor_buf[i] = rnd_b_rot[i] ^ token[i];
+  aes_enc_block_(app_rk_, xor_buf, token + 16);
 
   // Build APDU: [90 AF 00 00 20 <32 bytes> 00]
   uint8_t apdu2[38];
@@ -445,13 +480,81 @@ bool DesfireReaderComponent::df_auth_aes_() {
 
   uint8_t resp2[32];
   uint8_t resp2_len;
-  if (!desfire_apdu_(apdu2, sizeof(apdu2), resp2, sizeof(resp2), resp2_len, sw1, sw2))
+  if (!desfire_apdu_(apdu2, sizeof(apdu2), resp2, sizeof(resp2), resp2_len, sw1, sw2)) {
+    // Fix #4: zero all sensitive buffers before returning
+    secure_zero_((volatile uint8_t *)rnd_a, 16);
+    secure_zero_((volatile uint8_t *)rnd_b, 16);
+    secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
+    secure_zero_((volatile uint8_t *)token, 32);
+    secure_zero_((volatile uint8_t *)xor_buf, 16);
+    secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
     return false;
-  return (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK);
+  }
+  if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
+    secure_zero_((volatile uint8_t *)rnd_a, 16);
+    secure_zero_((volatile uint8_t *)rnd_b, 16);
+    secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
+    secure_zero_((volatile uint8_t *)token, 32);
+    secure_zero_((volatile uint8_t *)xor_buf, 16);
+    secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
+    return false;
+  }
+
+  if (resp2_len != 16) {
+    ESP_LOGE(TAG, "Auth response wrong length (%d, expected 16)", resp2_len);
+    secure_zero_((volatile uint8_t *)rnd_a, 16);
+    secure_zero_((volatile uint8_t *)rnd_b, 16);
+    secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
+    secure_zero_((volatile uint8_t *)token, 32);
+    secure_zero_((volatile uint8_t *)xor_buf, 16);
+    secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
+    return false;
+  }
+
+  // Build expected RndA' = RndA rotated left by 1 byte
+  uint8_t rnd_a_expected[16];
+  memcpy(rnd_a_expected, rnd_a + 1, 15);
+  rnd_a_expected[15] = rnd_a[0];
+
+  // ── Step 4: Decrypt E_k(RndA') with CBC, IV = token[16:31] ──
+  uint8_t dec_tmp[16];
+  aes_dec_block_(app_rk_, resp2, dec_tmp);
+  uint8_t rnd_a_received[16];
+  for (uint8_t i = 0; i < 16; i++)
+    rnd_a_received[i] = dec_tmp[i] ^ token[16 + i];
+
+  // Fix #2: removed all log_hex16_ debug dumps of cryptographic material
+
+  // Constant-time compare
+  uint8_t diff = 0;
+  for (uint8_t i = 0; i < 16; i++)
+    diff |= rnd_a_received[i] ^ rnd_a_expected[i];
+
+  bool ok = (diff == 0);
+
+  if (ok) {
+    ESP_LOGI(TAG, "Mutual AES auth verified — card is genuine");
+  } else {
+    ESP_LOGE(TAG, "Mutual auth FAILED — RndA' mismatch");
+  }
+
+  // Fix #4: zero ALL sensitive stack buffers before returning
+  secure_zero_((volatile uint8_t *)rnd_a, 16);
+  secure_zero_((volatile uint8_t *)rnd_b, 16);
+  secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
+  secure_zero_((volatile uint8_t *)rnd_a_expected, 16);
+  secure_zero_((volatile uint8_t *)rnd_a_received, 16);
+  secure_zero_((volatile uint8_t *)enc_rnd_b, 16);
+  secure_zero_((volatile uint8_t *)token, 32);
+  secure_zero_((volatile uint8_t *)xor_buf, 16);
+  secure_zero_((volatile uint8_t *)dec_tmp, 16);
+
+  return ok;
 }
 
 bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
                                            uint8_t *out, uint8_t &out_len) {
+  // length=0 means "read entire file" in DESFire
   uint8_t apdu[] = {
       0x90, 0xBD, 0x00, 0x00, 0x07, file_id,
       0x00, 0x00, 0x00,
@@ -463,8 +566,9 @@ bool DesfireReaderComponent::df_read_file_(uint8_t file_id, uint8_t length,
     return false;
   if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK))
     return false;
-  // Truncate to requested length (card may append 8-byte MAC)
-  uint8_t copy_len = (resp_len > length) ? length : resp_len;
+  uint8_t copy_len = resp_len;
+  if (length > 0 && resp_len > length)
+    copy_len = length;
   memcpy(out, resp, copy_len);
   out_len = copy_len;
   return true;
@@ -601,10 +705,15 @@ void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
 }
 
 bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
+                                              const uint8_t *iv_in,
                                               uint8_t *out) {
   if (len % 16 != 0)
     return false;
-  uint8_t iv[16] = {0};
+  uint8_t iv[16];
+  if (iv_in != nullptr)
+    memcpy(iv, iv_in, 16);
+  else
+    memset(iv, 0, 16);
   for (uint8_t b = 0; b < len; b += 16) {
     aes_dec_block_(data_rk_, in + b, out + b);
     for (uint8_t i = 0; i < 16; i++)
@@ -615,8 +724,15 @@ bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
 }
 
 void DesfireReaderComponent::random_bytes_(uint8_t *buf, uint8_t len) {
+#ifdef USE_ESP32
+  esp_fill_random(buf, len);
+#elif defined(USE_ESP8266)
   for (uint8_t i = 0; i < len; i++)
-    buf[i] = (uint8_t)(random(256));
+    buf[i] = static_cast<uint8_t>(*(volatile uint32_t *)0x3FF20E44);
+#else
+  for (uint8_t i = 0; i < len; i++)
+    buf[i] = static_cast<uint8_t>(esp_random());
+#endif
 }
 
 }  // namespace desfire_reader
