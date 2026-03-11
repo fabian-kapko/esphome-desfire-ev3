@@ -14,7 +14,7 @@ An ESPHome external component that reads and authenticates **MIFARE DESFire EV3*
 - **Fast card detection** — full auth + read completes in ~80–150 ms; card removal detected within ~300 ms
 - **Text and binary sensors** — UID, decrypted result, and auth status published to Home Assistant
 - Portable **software AES-128** — no external crypto libraries required
-- **ESP32 and ESP8266 compatible**
+- **ESP32 compatible**
 
 ---
 
@@ -23,7 +23,6 @@ An ESPHome external component that reads and authenticates **MIFARE DESFire EV3*
 | Component | Notes |
 |-----------|-------|
 | **ESP32** (recommended) | Any ESPHome-supported board. Dual-core gives best results. |
-| **ESP8266** | Works, but keep your YAML config lean (see [ESP8266 Notes](#esp8266-notes)). |
 | **PN532 NFC module** | Connected via I2C (default address `0x24`). |
 
 ### Wiring
@@ -257,33 +256,6 @@ The card must have an application with:
 - **File 0x01** — containing data encrypted with `data_key` under AES-128-CBC with a zero IV
 
 You can provision cards with [desfire-ev3-pywriter](https://github.com/fabian-kapko/desfire-ev3-pywriter).
-
----
-
-## ESP8266 Notes
-
-The component works on ESP8266 but with tighter constraints:
-
-| Resource | ESP8266 available | Component uses | Status |
-|---|---|---|---|
-| RAM | ~80 KB | ~1.1 KB | ✅ OK |
-| Flash | 1–4 MB | ~15–20 KB compiled | ✅ OK |
-| Stack | ~4 KB | ~200 B per `loop()` | ✅ OK |
-
-**Recommendations for ESP8266:**
-
-- Use `update_interval: 500ms` or higher (don't go below 300 ms)
-- Keep your YAML lean — avoid loading too many other components
-- Monitor free heap; keep it above ~15 KB for stable WiFi:
-
-```yaml
-sensor:
-  - platform: template
-    name: "Free Heap"
-    lambda: 'return ESP.getFreeHeap();'
-    update_interval: 10s
-    unit_of_measurement: "B"
-```
 
 ---
 
