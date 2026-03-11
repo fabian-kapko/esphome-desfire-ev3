@@ -1,7 +1,8 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import i2c, text_sensor, binary_sensor
-from esphome.const import CONF_ID
+from esphome.const import CONF_ID, CONF_SDA, CONF_SCL
+from esphome.core import CORE
 
 AUTO_LOAD = ["text_sensor", "binary_sensor"]
 
@@ -57,6 +58,27 @@ async def to_code(config):
 
     cg.add(var.set_app_key(config[CONF_APP_KEY]))
     cg.add(var.set_data_key(config[CONF_DATA_KEY]))
+
+    # Resolve SDA/SCL pins from the parent I2C bus configuration
+    i2c_id = config.get("i2c_id")
+    i2c_configs = CORE.config.get("i2c", [])
+    if not isinstance(i2c_configs, list):
+        i2c_configs = [i2c_configs]
+
+    i2c_conf = None
+    if i2c_id is not None:
+        for cfg in i2c_configs:
+            if cfg.get(CONF_ID) == i2c_id:
+                i2c_conf = cfg
+                break
+    elif len(i2c_configs) == 1:
+        i2c_conf = i2c_configs[0]
+
+    if i2c_conf is not None:
+        if CONF_SDA in i2c_conf:
+            cg.add(var.set_sda_pin(i2c_conf[CONF_SDA]))
+        if CONF_SCL in i2c_conf:
+            cg.add(var.set_scl_pin(i2c_conf[CONF_SCL]))
 
     if CONF_RESULT in config:
         sens = await text_sensor.new_text_sensor(config[CONF_RESULT])

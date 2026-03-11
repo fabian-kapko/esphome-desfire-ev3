@@ -17,7 +17,14 @@ void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
 
 void DesfireReaderComponent::recover_i2c_bus_() {
 #ifdef USE_ESP32
-  ESP_LOGD(TAG, "I2C bus recovery — clocking out stuck state");
+  if (sda_pin_ < 0 || scl_pin_ < 0) {
+    ESP_LOGW(TAG, "I2C bus recovery skipped — SDA/SCL pins not configured");
+    delay(10);
+    return;
+  }
+
+  ESP_LOGD(TAG, "I2C bus recovery — clocking out stuck state (SDA=%d SCL=%d)",
+           sda_pin_, scl_pin_);
 
   // Force-reset the I2C peripheral by doing a dummy write that will
   // timeout, which triggers the ESP-IDF driver's internal reset.
@@ -435,7 +442,11 @@ void DesfireReaderComponent::setup() {
   state_ = NfcState::IDLE;
   cooldown_until_ = 0;
   update_requested_ = false;
-  ESP_LOGCONFIG(TAG, "PN532 initialized (SDA=%d SCL=%d).", sda_pin_, scl_pin_);
+  if (sda_pin_ >= 0 && scl_pin_ >= 0) {
+    ESP_LOGCONFIG(TAG, "PN532 initialized (SDA=%d SCL=%d).", sda_pin_, scl_pin_);
+  } else {
+    ESP_LOGCONFIG(TAG, "PN532 initialized (SDA/SCL pins not configured — bus recovery disabled).");
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -908,7 +919,11 @@ void DesfireReaderComponent::loop() {
 void DesfireReaderComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "DESFire Reader:");
   ESP_LOGCONFIG(TAG, "  App ID: %02X:%02X:%02X", app_id_[0], app_id_[1], app_id_[2]);
-  ESP_LOGCONFIG(TAG, "  SDA: GPIO%d  SCL: GPIO%d", sda_pin_, scl_pin_);
+  if (sda_pin_ >= 0 && scl_pin_ >= 0) {
+    ESP_LOGCONFIG(TAG, "  SDA: GPIO%d  SCL: GPIO%d", sda_pin_, scl_pin_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  SDA/SCL: not configured (bus recovery disabled)");
+  }
   ESP_LOGCONFIG(TAG, "  Retries: %d", MAX_RETRIES);
   LOG_I2C_DEVICE(this);
 }
