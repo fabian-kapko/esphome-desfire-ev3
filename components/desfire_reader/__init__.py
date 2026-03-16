@@ -27,7 +27,6 @@ CONF_RESULT = "result"
 CONF_AUTH_OK = "auth_ok"
 CONF_UID = "uid"
 CONF_NONAUTHORISED_CARD_UID = "nonauthorised_card_uid"
-CONF_PROXIMITY_CHECK = "proximity_check"
 CONF_COMM_MODE = "comm_mode"
 
 
@@ -55,7 +54,6 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_AUTH_OK): binary_sensor.binary_sensor_schema(),
             cv.Optional(CONF_UID): text_sensor.text_sensor_schema(),
             cv.Optional(CONF_NONAUTHORISED_CARD_UID): text_sensor.text_sensor_schema(),
-            cv.Optional(CONF_PROXIMITY_CHECK, default=False): cv.boolean,
             cv.Optional(CONF_COMM_MODE, default="plain"): cv.enum(COMM_MODES, lower=True),
         }
     )
@@ -76,7 +74,6 @@ async def to_code(config):
     if CONF_DATA_KEY in config:
         cg.add(var.set_data_key(config[CONF_DATA_KEY]))
 
-    cg.add(var.set_proximity_check(config[CONF_PROXIMITY_CHECK]))
     cg.add(var.set_comm_mode(config[CONF_COMM_MODE]))
 
     # Resolve SDA/SCL pins from the parent I2C bus configuration

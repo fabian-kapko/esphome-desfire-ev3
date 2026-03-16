@@ -40,9 +40,6 @@ static const uint32_t COOLDOWN_FAIL_MAX_MS = 5000;
 static const uint8_t NO_CARD_THRESHOLD = 2;
 static const uint8_t MAX_RETRIES = 2;
 
-// Proximity check: number of random bytes exchanged (standard = 7)
-static const uint8_t PC_NUM_ROUNDS = 7;
-
 // File communication modes (matches DESFire spec)
 enum class CommMode : uint8_t {
   PLAIN = 0,   // No protection after auth (legacy, backward compat)
@@ -68,13 +65,6 @@ enum class NfcState : uint8_t {
   AUTH1_WAIT_RESP,
   AUTH2_WAIT_ACK,
   AUTH2_WAIT_RESP,
-  // ── Proximity check (after auth, before read) ──
-  PC_PREP_WAIT_ACK,
-  PC_PREP_WAIT_RESP,
-  PC_ROUND_WAIT_ACK,
-  PC_ROUND_WAIT_RESP,
-  PC_VERIFY_WAIT_ACK,
-  PC_VERIFY_WAIT_RESP,
   // ── Data read ──
   READ_WAIT_ACK,
   READ_WAIT_RESP,
@@ -125,7 +115,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void set_sda_pin(int pin) { sda_pin_ = pin; }
   void set_scl_pin(int pin) { scl_pin_ = pin; }
 
-  void set_proximity_check(bool en) { proximity_check_enabled_ = en; }
   void set_comm_mode(CommMode m) { comm_mode_ = m; }
 
  protected:
@@ -170,7 +159,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void clear_card_state_();
   void start_release_();
   void start_select_app_();
-  void start_proximity_check_();
   void start_read_file_();
   void recover_i2c_bus_();
   void pn532_wakeup_();
@@ -183,7 +171,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t data_rk_[176]{};
   bool has_data_key_{false};
   CommMode comm_mode_{CommMode::PLAIN};
-  bool proximity_check_enabled_{false};
 
   int sda_pin_{-1};
   int scl_pin_{-1};
@@ -232,12 +219,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t ti_[4]{};              // Transaction Identifier from auth
   uint16_t cmd_ctr_{0};          // Command counter (increments per cmd-resp pair)
   bool ev2_authenticated_{false};
-
-  // ── Proximity check state ──
-  uint8_t pc_rnd_r_[PC_NUM_ROUNDS]{};  // Reader's random bytes
-  uint8_t pc_rnd_c_[PC_NUM_ROUNDS]{};  // Card's random bytes
-  uint8_t pc_current_round_{0};
-  bool pc_failed_this_card_{false};     // Set if PC fails; cleared on new card
 
   static const uint16_t ACK_TIMEOUT_MS = 50;
   static const uint16_t RESP_TIMEOUT_MS = 150;

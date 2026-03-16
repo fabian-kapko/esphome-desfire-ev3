@@ -354,7 +354,6 @@ void DesfireReaderComponent::clear_card_state_() {
   retry_count_ = 0;
   nonauthorised_fail_count_ = 0;
   ev2_authenticated_ = false;
-  pc_failed_this_card_ = false;
   publish_auth_(false);
   publish_result_("");
   publish_uid_("");
@@ -387,22 +386,6 @@ void DesfireReaderComponent::start_select_app_() {
     return;
   }
   state_ = NfcState::SELECT_WAIT_ACK;
-  state_entered_at_ = millis();
-}
-
-void DesfireReaderComponent::start_proximity_check_() {
-  random_bytes_(pc_rnd_r_, PC_NUM_ROUNDS);
-  memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);
-  pc_current_round_ = 0;
-
-  // PreparePC: CLA=90 INS=F0 P1=00 P2=00 Lc=01 Data=00(option) Le=00
-  uint8_t apdu[] = {0x90, 0xF0, 0x00, 0x00, 0x01, 0x00, 0x00};
-  if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
-    ESP_LOGE(TAG, "PreparePC send failed");
-    handle_retry_();
-    return;
-  }
-  state_ = NfcState::PC_PREP_WAIT_ACK;
   state_entered_at_ = millis();
 }
 
@@ -1007,14 +990,7 @@ void DesfireReaderComponent::loop() {
 
       ESP_LOGI(TAG, "Mutual AES EV2 auth verified — secure channel established");
 
-      // Next step: proximity check if enabled and not already failed for this card
-      if (proximity_check_enabled_ && !pc_failed_this_card_) {
-        start_proximity_check_();
-      } else {
-        if (pc_failed_this_card_)
-          ESP_LOGW(TAG, "Proximity check skipped (card doesn't support it)");
-        start_read_file_();
-      }
+      start_read_file_();
       return;
     }
 
@@ -1022,206 +998,6 @@ void DesfireReaderComponent::loop() {
       ESP_LOGE(TAG, "Auth2 read timeout");
       note_nonauthorised_failure_();
       handle_retry_();
-    }
-    return;
-  }
-
-  // ═════════════════════════════════════════════
-  //  Proximity Check states
-  // ═════════════════════════════════════════════
-
-  case NfcState::PC_PREP_WAIT_ACK: {
-    if (try_read_ack_()) {
-      state_ = NfcState::PC_PREP_WAIT_RESP;
-      state_entered_at_ = millis();
-      return;
-    }
-    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "PreparePC ACK timeout — releasing target for clean retry");
-      pc_failed_this_card_ = true;
-      prev_uid_len_ = 0;  // Force re-detect of same card
-      start_release_();
-    }
-    return;
-  }
-
-  case NfcState::PC_PREP_WAIT_RESP: {
-    uint8_t resp[16];
-    uint8_t resp_len, sw1, sw2;
-
-    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
-      ESP_LOGD(TAG, "PreparePC response: sw1=0x%02X sw2=0x%02X len=%d", sw1, sw2, resp_len);
-      if (resp_len > 0)
-        ESP_LOGD(TAG, "PreparePC data[0]=0x%02X", resp[0]);
-
-      if (sw1 != DESFIRE_SW1) {
-        // Not a DESFire response — card may not support ISO-wrapped PC
-        ESP_LOGW(TAG, "PreparePC: non-DESFire SW1 (0x%02X) — PC not supported?", sw1);
-        pc_failed_this_card_ = true;
-        prev_uid_len_ = 0;
-        start_release_();
-        return;
-      }
-
-      if (sw2 != DESFIRE_MORE_FRAMES && sw2 != DESFIRE_OK) {
-        ESP_LOGW(TAG, "PreparePC rejected (sw2=0x%02X) — releasing for clean retry", sw2);
-        pc_failed_this_card_ = true;
-        prev_uid_len_ = 0;
-        start_release_();
-        return;
-      }
-
-      if (sw2 == DESFIRE_OK) {
-        ESP_LOGD(TAG, "PreparePC OK (immediate, sw2=0x00)");
-      }
-
-      memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);
-      ESP_LOGD(TAG, "PreparePC OK — starting %d proximity check rounds", PC_NUM_ROUNDS);
-
-      pc_current_round_ = 0;
-      uint8_t apdu[] = {0x90, 0xF2, 0x00, 0x00, 0x01,
-                        pc_rnd_r_[0], 0x00};
-      if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
-        ESP_LOGW(TAG, "ProximityCheck round 0 send failed — releasing");
-        pc_failed_this_card_ = true;
-        prev_uid_len_ = 0;
-        start_release_();
-        return;
-      }
-      state_ = NfcState::PC_ROUND_WAIT_ACK;
-      state_entered_at_ = millis();
-      return;
-    }
-
-    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "PreparePC resp timeout — releasing for clean retry");
-      pc_failed_this_card_ = true;
-      prev_uid_len_ = 0;
-      start_release_();
-    }
-    return;
-  }
-
-  case NfcState::PC_ROUND_WAIT_ACK: {
-    if (try_read_ack_()) {
-      state_ = NfcState::PC_ROUND_WAIT_RESP;
-      state_entered_at_ = millis();
-      return;
-    }
-    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "ProximityCheck round %d ACK timeout", pc_current_round_);
-      // On timeout during proximity check, fail — this could be a relay attack
-      ESP_LOGE(TAG, "Proximity check FAILED — possible relay attack");
-      handle_fail_();
-    }
-    return;
-  }
-
-  case NfcState::PC_ROUND_WAIT_RESP: {
-    uint8_t resp[4];
-    uint8_t resp_len, sw1, sw2;
-
-    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
-      if (sw2 != DESFIRE_MORE_FRAMES || resp_len < 1) {
-        ESP_LOGE(TAG, "ProximityCheck round %d bad response (sw2=0x%02X, len=%d)",
-                 pc_current_round_, sw2, resp_len);
-        ESP_LOGE(TAG, "Proximity check FAILED — card rejected round");
-        handle_fail_();
-        return;
-      }
-
-      // Save card's random byte for this round
-      pc_rnd_c_[pc_current_round_] = resp[0];
-      pc_current_round_++;
-
-      if (pc_current_round_ < PC_NUM_ROUNDS) {
-        // Send next round
-        uint8_t apdu[] = {0x90, 0xF2, 0x00, 0x00, 0x01,
-                          pc_rnd_r_[pc_current_round_], 0x00};
-        if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
-          ESP_LOGE(TAG, "ProximityCheck round %d send failed", pc_current_round_);
-          handle_fail_();
-          return;
-        }
-        state_ = NfcState::PC_ROUND_WAIT_ACK;
-        state_entered_at_ = millis();
-        return;
-      }
-
-      // All rounds done — send VerifyPC with MAC
-      // MAC input = pRndR(7) || pRndC(7)
-      uint8_t mac_input[14];
-      memcpy(mac_input, pc_rnd_r_, 7);
-      memcpy(mac_input + 7, pc_rnd_c_, 7);
-
-      uint8_t full_mac[16];
-      aes_cmac_(ses_auth_mac_rk_, mac_input, 14, full_mac);
-
-      uint8_t mac8[8];
-      aes_cmac_truncate_(full_mac, mac8);
-
-      secure_zero_((volatile uint8_t *)mac_input, 14);
-      secure_zero_((volatile uint8_t *)full_mac, 16);
-
-      // VerifyPC: 90 F5 00 00 08 <8 bytes MAC> 00
-      uint8_t apdu[14];
-      apdu[0] = 0x90;
-      apdu[1] = 0xF5;
-      apdu[2] = 0x00;
-      apdu[3] = 0x00;
-      apdu[4] = 0x08;
-      memcpy(apdu + 5, mac8, 8);
-      apdu[13] = 0x00;
-
-      if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
-        ESP_LOGE(TAG, "VerifyPC send failed");
-        handle_fail_();
-        return;
-      }
-      state_ = NfcState::PC_VERIFY_WAIT_ACK;
-      state_entered_at_ = millis();
-      return;
-    }
-
-    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGE(TAG, "ProximityCheck round %d resp timeout", pc_current_round_);
-      ESP_LOGE(TAG, "Proximity check FAILED — timeout (possible relay?)");
-      handle_fail_();
-    }
-    return;
-  }
-
-  case NfcState::PC_VERIFY_WAIT_ACK: {
-    if (try_read_ack_()) {
-      state_ = NfcState::PC_VERIFY_WAIT_RESP;
-      state_entered_at_ = millis();
-      return;
-    }
-    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
-      ESP_LOGE(TAG, "VerifyPC ACK timeout");
-      handle_fail_();
-    }
-    return;
-  }
-
-  case NfcState::PC_VERIFY_WAIT_RESP: {
-    uint8_t resp[8];
-    uint8_t resp_len, sw1, sw2;
-
-    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
-      if (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK) {
-        ESP_LOGI(TAG, "Proximity check PASSED — card is physically close");
-        start_read_file_();
-        return;
-      }
-      ESP_LOGE(TAG, "Proximity check FAILED — card may be relayed (sw2=0x%02X)", sw2);
-      handle_fail_();
-      return;
-    }
-
-    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGE(TAG, "VerifyPC resp timeout");
-      handle_fail_();
     }
     return;
   }
@@ -1469,8 +1245,6 @@ void DesfireReaderComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Comm mode: %s",
                 comm_mode_ == CommMode::FULL ? "Full (encrypted+CMAC)" :
                 comm_mode_ == CommMode::MAC  ? "MAC (integrity)" : "Plain (legacy)");
-  ESP_LOGCONFIG(TAG, "  Proximity check: %s",
-                proximity_check_enabled_ ? "enabled" : "disabled");
   ESP_LOGCONFIG(TAG, "  Data key: %s", has_data_key_ ? "configured" : "not set");
   if (sda_pin_ >= 0 && scl_pin_ >= 0) {
     ESP_LOGCONFIG(TAG, "  SDA: GPIO%d  SCL: GPIO%d", sda_pin_, scl_pin_);
