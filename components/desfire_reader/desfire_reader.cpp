@@ -412,9 +412,8 @@ void DesfireReaderComponent::start_read_file_() {
   uint8_t apdu[24];
   uint8_t apdu_len;
 
-  if (ev2_authenticated_) {
-    // EV2 session: ALL commands require CMAC, regardless of file comm mode.
-    // The comm mode only affects how the response DATA is protected.
+  if (ev2_authenticated_ && comm_mode_ != CommMode::PLAIN) {
+    // MAC/Full mode: append command CMAC to file data ops
     uint8_t mac8[8];
     compute_cmd_mac_(0xBD, cmd_data, sizeof(cmd_data), mac8);
 
@@ -428,7 +427,7 @@ void DesfireReaderComponent::start_read_file_() {
     apdu[5 + sizeof(cmd_data) + 8] = 0x00;
     apdu_len = 5 + sizeof(cmd_data) + 8 + 1;
   } else {
-    // Plain ReadData (no CMAC)
+    // Plain mode or no EV2 session: no command CMAC on file data ops
     apdu[0] = 0x90;
     apdu[1] = 0xBD;
     apdu[2] = 0x00;
@@ -1270,23 +1269,15 @@ void DesfireReaderComponent::loop() {
     uint8_t decrypted[64];
     uint8_t dec_len = 0;
 
-    // ┌─────────────────────────────────────────────────────────────┐
-    // │  In an EV2 session, ALL responses carry an 8-byte CMAC,    │
-    // │  regardless of the file's CommMode setting.                │
-    // │                                                            │
-    // │  CommMode determines how the DATA portion is protected:    │
-    // │    PLAIN: data in cleartext  + response CMAC(8)            │
-    // │    MAC:   data in cleartext  + response CMAC(8)            │
-    // │    FULL:  data AES-CBC encrypted + response CMAC(8)        │
-    // │                                                            │
-    // │  Without EV2 session (shouldn't happen in new code, but    │
-    // │  kept for safety): raw data, no CMAC, local data_key only. │
-    // └─────────────────────────────────────────────────────────────┘
+    // Response handling depends on file CommMode:
+    //   FULL:  EncData(N) || CMAC(8) — decrypt + verify
+    //   MAC:   Data(N) || CMAC(8) — verify integrity
+    //   PLAIN: Data(N) — no CMAC, optional local data_key decrypt
 
-    if (ev2_authenticated_) {
-      // All EV2 responses: last 8 bytes are truncated CMAC
-      if (raw_file_len_ < 8) {
-        ESP_LOGE(TAG, "EV2 response too short for CMAC (%d bytes)", raw_file_len_);
+    if (ev2_authenticated_ && comm_mode_ == CommMode::FULL) {
+      // ── FULL: response = EncData(N) || CMAC(8) ──
+      if (raw_file_len_ < 24) {
+        ESP_LOGE(TAG, "FULL response too short (%d bytes)", raw_file_len_);
         handle_fail_();
         return;
       }
@@ -1295,77 +1286,82 @@ void DesfireReaderComponent::loop() {
       uint8_t *resp_data = raw_file_;
       uint8_t *resp_mac  = raw_file_ + data_len;
 
-      // The cmd_ctr was already incremented after ReadData response.
-      // CMAC verification needs the counter value AT the time of the command.
+      if (data_len == 0 || data_len % 16 != 0) {
+        ESP_LOGE(TAG, "FULL: encrypted data not block-aligned (%d)", data_len);
+        handle_fail_();
+        return;
+      }
+
       uint16_t saved_ctr = cmd_ctr_;
       cmd_ctr_ = saved_ctr - 1;
 
-      if (comm_mode_ == CommMode::FULL) {
-        // ── FULL: decrypt data with session ENC key, then verify CMAC ──
-        if (data_len == 0 || data_len % 16 != 0) {
-          ESP_LOGE(TAG, "FULL: encrypted data not block-aligned (%d)", data_len);
-          cmd_ctr_ = saved_ctr;
-          handle_fail_();
-          return;
-        }
+      uint8_t iv[16];
+      compute_ev2_iv_(true, iv);
+      aes_cbc_decrypt_with_key_(ses_auth_enc_rk_, resp_data, data_len, iv, decrypted);
 
-        uint8_t iv[16];
-        compute_ev2_iv_(true, iv);  // response IV
-        aes_cbc_decrypt_with_key_(ses_auth_enc_rk_, resp_data, data_len, iv, decrypted);
+      // Strip ISO 9797-1 M2 padding
+      dec_len = data_len;
+      while (dec_len > 0 && decrypted[dec_len - 1] == 0x00)
+        dec_len--;
+      if (dec_len > 0 && decrypted[dec_len - 1] == 0x80)
+        dec_len--;
 
-        // Strip ISO 9797-1 M2 padding (0x80 0x00...)
-        dec_len = data_len;
-        while (dec_len > 0 && decrypted[dec_len - 1] == 0x00)
-          dec_len--;
-        if (dec_len > 0 && decrypted[dec_len - 1] == 0x80)
-          dec_len--;
-
-        if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len, resp_mac)) {
-          ESP_LOGE(TAG, "FULL: CMAC verification FAILED");
-          cmd_ctr_ = saved_ctr;
-          secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-          handle_fail_();
-          return;
-        }
-
-        ESP_LOGD(TAG, "FULL: decrypted %d bytes, CMAC verified", dec_len);
-
-      } else {
-        // ── PLAIN or MAC: data is cleartext, verify CMAC ──
-        memcpy(decrypted, resp_data, data_len);
-        dec_len = data_len;
-
-        if (!verify_resp_mac_(DESFIRE_OK, resp_data, data_len, resp_mac)) {
-          ESP_LOGE(TAG, "EV2 response CMAC verification FAILED");
-          cmd_ctr_ = saved_ctr;
-          secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-          handle_fail_();
-          return;
-        }
-
-        ESP_LOGD(TAG, "EV2 CMAC verified (%d data bytes, mode=%s)",
-                 dec_len, comm_mode_ == CommMode::MAC ? "MAC" : "PLAIN");
-
-        // If data_key is configured, the file holds pre-encrypted ciphertext.
-        // Decrypt locally after CMAC verification.
-        if (has_data_key_) {
-          uint8_t cipher_len = (dec_len / 16) * 16;
-          if (cipher_len > 0 && cipher_len <= sizeof(decrypted)) {
-            uint8_t tmp[64];
-            uint8_t zero_iv[16] = {0};
-            aes_cbc_decrypt_with_key_(data_rk_, decrypted, cipher_len, zero_iv, tmp);
-            memcpy(decrypted, tmp, cipher_len);
-            dec_len = cipher_len;
-            secure_zero_((volatile uint8_t *)tmp, sizeof(tmp));
-            ESP_LOGD(TAG, "Local data_key decryption OK (%d bytes)", dec_len);
-          }
-        }
+      if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len, resp_mac)) {
+        ESP_LOGE(TAG, "FULL: CMAC verification FAILED");
+        cmd_ctr_ = saved_ctr;
+        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+        handle_fail_();
+        return;
       }
 
       cmd_ctr_ = saved_ctr;
+      ESP_LOGD(TAG, "FULL: decrypted %d bytes, CMAC verified", dec_len);
+
+    } else if (ev2_authenticated_ && comm_mode_ == CommMode::MAC) {
+      // ── MAC: response = Data(N) || CMAC(8) ──
+      if (raw_file_len_ < 9) {
+        ESP_LOGE(TAG, "MAC response too short (%d bytes)", raw_file_len_);
+        handle_fail_();
+        return;
+      }
+
+      uint8_t data_len = raw_file_len_ - 8;
+      uint8_t *resp_data = raw_file_;
+      uint8_t *resp_mac  = raw_file_ + data_len;
+
+      uint16_t saved_ctr = cmd_ctr_;
+      cmd_ctr_ = saved_ctr - 1;
+
+      memcpy(decrypted, resp_data, data_len);
+      dec_len = data_len;
+
+      if (!verify_resp_mac_(DESFIRE_OK, resp_data, data_len, resp_mac)) {
+        ESP_LOGE(TAG, "MAC: CMAC verification FAILED");
+        cmd_ctr_ = saved_ctr;
+        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+        handle_fail_();
+        return;
+      }
+
+      cmd_ctr_ = saved_ctr;
+      ESP_LOGD(TAG, "MAC: CMAC verified (%d data bytes)", dec_len);
+
+      // If data_key configured, decrypt locally
+      if (has_data_key_) {
+        uint8_t cipher_len = (dec_len / 16) * 16;
+        if (cipher_len > 0 && cipher_len <= sizeof(decrypted)) {
+          uint8_t tmp[64];
+          uint8_t zero_iv[16] = {0};
+          aes_cbc_decrypt_with_key_(data_rk_, decrypted, cipher_len, zero_iv, tmp);
+          memcpy(decrypted, tmp, cipher_len);
+          dec_len = cipher_len;
+          secure_zero_((volatile uint8_t *)tmp, sizeof(tmp));
+        }
+      }
 
     } else {
-      // ── No EV2 session (fallback, shouldn't normally reach here) ──
+      // ── PLAIN (with or without EV2 session): raw data, no CMAC ──
+      // The response is just the file contents, no trailing MAC.
       if (has_data_key_) {
         uint8_t cipher_len = (raw_file_len_ / 16) * 16;
         if (cipher_len == 0 || cipher_len > sizeof(decrypted)) {
@@ -1373,6 +1369,8 @@ void DesfireReaderComponent::loop() {
           handle_fail_();
           return;
         }
+        if (raw_file_len_ != cipher_len)
+          ESP_LOGD(TAG, "Stripped %d trailing bytes", raw_file_len_ - cipher_len);
         uint8_t zero_iv[16] = {0};
         if (!aes_cbc_decrypt_with_key_(data_rk_, raw_file_, cipher_len, zero_iv, decrypted)) {
           ESP_LOGE(TAG, "AES decrypt FAILED");
