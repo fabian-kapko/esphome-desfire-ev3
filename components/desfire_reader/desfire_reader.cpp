@@ -26,40 +26,27 @@ void DesfireReaderComponent::recover_i2c_bus_() {
   gpio_num_t sda = (gpio_num_t)sda_pin_;
   gpio_num_t scl = (gpio_num_t)scl_pin_;
 
-  // ── SAFETY GUARD ────────────────────────────────────────────────────────────
-  // Only steal the bus if SDA is genuinely stuck low.  Unconditionally clocking
-  // SCL while other devices are mid-transaction would corrupt their data.
-  //
-  // Configuring SDA as a plain GPIO input briefly disconnects it from the I2C
-  // peripheral, but if SDA is already stuck low the peripheral is already in
-  // an error state — no successful transaction can be in flight.
   gpio_reset_pin(sda);
   gpio_set_direction(sda, GPIO_MODE_INPUT);
   gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
-  delayMicroseconds(20);  // let the external pullup charge the line
+  delayMicroseconds(20);
 
   if (gpio_get_level(sda) != 0) {
-    // SDA is already high — the bus is not stuck.  The I2C peripheral will
-    // recover on its own; no GPIO manipulation needed.
-    gpio_reset_pin(sda);   // restore to default input, I2C driver reclaims on next tx
+    gpio_reset_pin(sda);
     ESP_LOGD(TAG, "I2C bus recovery: SDA already free — skipping clock-out");
     uint8_t dummy;
-    this->read(&dummy, 1);  // triggers ESP-IDF's internal I2C error recovery
+    this->read(&dummy, 1);
     return;
   }
 
-  // SDA is stuck low.  Warn: the 9-clock sequence will briefly interrupt any
-  // other I2C device sharing this physical bus (same SDA/SCL wires).
   ESP_LOGW(TAG, "I2C bus recovery — SDA stuck low, clocking out "
            "(SDA=GPIO%d SCL=GPIO%d). Other I2C devices on this bus may be "
            "briefly interrupted.", sda_pin_, scl_pin_);
 
-  // Take control of SCL to clock out the stuck slave
   gpio_reset_pin(scl);
   gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
   gpio_set_level(scl, 1);
 
-  // Clock 9 times — if SDA is stuck low, this lets the slave release it
   for (int i = 0; i < 9; i++) {
     gpio_set_level(scl, 0);
     delayMicroseconds(5);
@@ -69,7 +56,6 @@ void DesfireReaderComponent::recover_i2c_bus_() {
       break;
   }
 
-  // Generate STOP condition: SDA low→high while SCL is high
   gpio_set_direction(sda, GPIO_MODE_OUTPUT_OD);
   gpio_set_level(sda, 0);
   delayMicroseconds(5);
@@ -78,22 +64,14 @@ void DesfireReaderComponent::recover_i2c_bus_() {
   gpio_set_level(sda, 1);
   delayMicroseconds(5);
 
-  // Leave SCL and SDA as open-drain HIGH rather than calling gpio_reset_pin().
-  // gpio_reset_pin() clears the GPIO-matrix connections that ESPHome set up
-  // during I2C init, permanently severing the I2C peripheral from the physical
-  // pins until the next reboot.  Leaving them as OD-HIGH is the I2C idle state;
-  // the throwaway read below will fail (expected), which causes the ESP-IDF I2C
-  // master driver to run its own internal error-recovery path — that path
-  // re-connects the GPIO matrix, restoring normal operation.
   gpio_set_direction(scl, GPIO_MODE_INPUT_OUTPUT_OD);
   gpio_set_level(scl, 1);
   gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
   gpio_set_level(sda, 1);
 
   uint8_t dummy;
-  this->read(&dummy, 1);  // expected to fail; triggers ESP-IDF I2C error recovery
+  this->read(&dummy, 1);
 #else
-  // ESP8266: just wait a bit, the hardware is simpler
   delay(10);
 #endif
 }
@@ -112,7 +90,6 @@ void DesfireReaderComponent::pn532_wakeup_() {
 bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len) {
   uint8_t frame[PN532_BUF_SIZE];
   uint8_t len = cmd_len + 1;
-  // Use uint16_t to avoid wrapping if cmd_len is near 255.
   uint16_t total = (uint16_t)6 + cmd_len + 2;
 
   if (total > sizeof(frame))
@@ -312,8 +289,8 @@ void DesfireReaderComponent::handle_fail_() {
   publish_auth_(false);
   retry_count_ = 0;
   prev_uid_len_ = 0;
+  ev2_authenticated_ = false;
 
-  // Recover bus before going idle
   recover_i2c_bus_();
   pn532_wakeup_();
 
@@ -322,7 +299,12 @@ void DesfireReaderComponent::handle_fail_() {
   cooldown_until_ = millis() + delay_ms;
   secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
   secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
+  secure_zero_((volatile uint8_t *)rnd_b_dec_, sizeof(rnd_b_dec_));
   secure_zero_((volatile uint8_t *)token_, sizeof(token_));
+  secure_zero_((volatile uint8_t *)ses_auth_enc_key_, sizeof(ses_auth_enc_key_));
+  secure_zero_((volatile uint8_t *)ses_auth_mac_key_, sizeof(ses_auth_mac_key_));
+  secure_zero_((volatile uint8_t *)ses_auth_enc_rk_, sizeof(ses_auth_enc_rk_));
+  secure_zero_((volatile uint8_t *)ses_auth_mac_rk_, sizeof(ses_auth_mac_rk_));
 }
 
 void DesfireReaderComponent::handle_retry_() {
@@ -333,16 +315,20 @@ void DesfireReaderComponent::handle_retry_() {
     return;
   }
   ESP_LOGD(TAG, "Retry %d/%d — recovering bus", retry_count_, MAX_RETRIES);
+  ev2_authenticated_ = false;
   secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
   secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
+  secure_zero_((volatile uint8_t *)rnd_b_dec_, sizeof(rnd_b_dec_));
   secure_zero_((volatile uint8_t *)token_, sizeof(token_));
+  secure_zero_((volatile uint8_t *)ses_auth_enc_key_, sizeof(ses_auth_enc_key_));
+  secure_zero_((volatile uint8_t *)ses_auth_mac_key_, sizeof(ses_auth_mac_key_));
+  secure_zero_((volatile uint8_t *)ses_auth_enc_rk_, sizeof(ses_auth_enc_rk_));
+  secure_zero_((volatile uint8_t *)ses_auth_mac_rk_, sizeof(ses_auth_mac_rk_));
 
-  // Always recover bus on retry — the timeout may have left it stuck
   recover_i2c_bus_();
   pn532_wakeup_();
 
-  // Go to BUS_RECOVERY state, which waits then goes to IDLE for re-detect
-  prev_uid_len_ = 0;  // force re-detect of same card
+  prev_uid_len_ = 0;
   state_ = NfcState::BUS_RECOVERY;
   state_entered_at_ = millis();
   cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
@@ -351,9 +337,15 @@ void DesfireReaderComponent::handle_retry_() {
 void DesfireReaderComponent::reset_to_idle_(uint32_t cooldown_ms) {
   state_ = NfcState::IDLE;
   cooldown_until_ = millis() + cooldown_ms;
+  ev2_authenticated_ = false;
   secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
   secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
+  secure_zero_((volatile uint8_t *)rnd_b_dec_, sizeof(rnd_b_dec_));
   secure_zero_((volatile uint8_t *)token_, sizeof(token_));
+  secure_zero_((volatile uint8_t *)ses_auth_enc_key_, sizeof(ses_auth_enc_key_));
+  secure_zero_((volatile uint8_t *)ses_auth_mac_key_, sizeof(ses_auth_mac_key_));
+  secure_zero_((volatile uint8_t *)ses_auth_enc_rk_, sizeof(ses_auth_enc_rk_));
+  secure_zero_((volatile uint8_t *)ses_auth_mac_rk_, sizeof(ses_auth_mac_rk_));
 }
 
 void DesfireReaderComponent::clear_card_state_() {
@@ -361,6 +353,7 @@ void DesfireReaderComponent::clear_card_state_() {
   prev_uid_len_ = 0;
   retry_count_ = 0;
   nonauthorised_fail_count_ = 0;
+  ev2_authenticated_ = false;
   publish_auth_(false);
   publish_result_("");
   publish_uid_("");
@@ -374,7 +367,6 @@ void DesfireReaderComponent::start_release_() {
     state_ = NfcState::RELEASE_WAIT_ACK;
     state_entered_at_ = millis();
   } else {
-    // Release write failed — bus is stuck, recover it
     ESP_LOGW(TAG, "Release send failed — recovering bus");
     recover_i2c_bus_();
     pn532_wakeup_();
@@ -397,14 +389,188 @@ void DesfireReaderComponent::start_select_app_() {
   state_entered_at_ = millis();
 }
 
+void DesfireReaderComponent::start_proximity_check_() {
+  random_bytes_(pc_rnd_r_, PC_NUM_ROUNDS);
+  memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);
+  pc_current_round_ = 0;
+
+  // PreparePC: 90 F0 00 00 00
+  uint8_t apdu[] = {0x90, 0xF0, 0x00, 0x00, 0x00};
+  if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
+    ESP_LOGE(TAG, "PreparePC send failed");
+    handle_retry_();
+    return;
+  }
+  state_ = NfcState::PC_PREP_WAIT_ACK;
+  state_entered_at_ = millis();
+}
+
+void DesfireReaderComponent::start_read_file_() {
+  // Build ReadData command: BD fileNo=01 offset=000000 length=000000
+  uint8_t cmd_data[] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  uint8_t apdu[24];
+  uint8_t apdu_len;
+
+  if (ev2_authenticated_ && comm_mode_ != CommMode::PLAIN) {
+    // Append command CMAC for EV2 secured read
+    uint8_t mac8[8];
+    compute_cmd_mac_(0xBD, cmd_data, sizeof(cmd_data), mac8);
+
+    apdu[0] = 0x90;
+    apdu[1] = 0xBD;
+    apdu[2] = 0x00;
+    apdu[3] = 0x00;
+    apdu[4] = sizeof(cmd_data) + 8; // Lc = data + MAC
+    memcpy(apdu + 5, cmd_data, sizeof(cmd_data));
+    memcpy(apdu + 5 + sizeof(cmd_data), mac8, 8);
+    apdu[5 + sizeof(cmd_data) + 8] = 0x00;
+    apdu_len = 5 + sizeof(cmd_data) + 8 + 1;
+  } else {
+    // Plain ReadData (no CMAC)
+    apdu[0] = 0x90;
+    apdu[1] = 0xBD;
+    apdu[2] = 0x00;
+    apdu[3] = 0x00;
+    apdu[4] = sizeof(cmd_data);
+    memcpy(apdu + 5, cmd_data, sizeof(cmd_data));
+    apdu[5 + sizeof(cmd_data)] = 0x00;
+    apdu_len = 5 + sizeof(cmd_data) + 1;
+  }
+
+  if (!send_desfire_apdu_(apdu, apdu_len)) {
+    ESP_LOGE(TAG, "ReadFile send failed");
+    handle_retry_();
+    return;
+  }
+  state_ = NfcState::READ_WAIT_ACK;
+  state_entered_at_ = millis();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  EV2 session key derivation and secure channel helpers
+// ═══════════════════════════════════════════════════════════════
+
+void DesfireReaderComponent::derive_session_keys_() {
+  // Build SV1 (32 bytes) for MAC session key
+  // SV1: A5 5A 00 01 00 80 || RndA[0:2] || (RndA[2:8] XOR RndB[0:6])
+  //      || RndB[6:16] || RndA[8:16]
+  uint8_t sv[32];
+
+  // SV1 — MAC key
+  sv[0] = 0xA5; sv[1] = 0x5A;
+  sv[2] = 0x00; sv[3] = 0x01; sv[4] = 0x00; sv[5] = 0x80;
+  sv[6] = rnd_a_[0]; sv[7] = rnd_a_[1];
+  for (uint8_t i = 0; i < 6; i++)
+    sv[8 + i] = rnd_a_[2 + i] ^ rnd_b_dec_[i];
+  memcpy(sv + 14, rnd_b_dec_ + 6, 10);
+  memcpy(sv + 24, rnd_a_ + 8, 8);
+
+  aes_cmac_(app_rk_, sv, 32, ses_auth_mac_key_);
+  aes_key_exp_(ses_auth_mac_key_, ses_auth_mac_rk_);
+
+  // SV2 — ENC key (same structure, different prefix)
+  sv[0] = 0x5A; sv[1] = 0xA5;
+  // bytes 2..31 are identical to SV1
+
+  aes_cmac_(app_rk_, sv, 32, ses_auth_enc_key_);
+  aes_key_exp_(ses_auth_enc_key_, ses_auth_enc_rk_);
+
+  secure_zero_((volatile uint8_t *)sv, sizeof(sv));
+
+  cmd_ctr_ = 0;
+  ev2_authenticated_ = true;
+
+  ESP_LOGD(TAG, "EV2 session keys derived, TI=%02X%02X%02X%02X",
+           ti_[0], ti_[1], ti_[2], ti_[3]);
+}
+
+void DesfireReaderComponent::compute_ev2_iv_(bool for_response, uint8_t *iv) {
+  // IV = Enc(SesAuthENCKey, Label || TI || CmdCtr_LE || padding)
+  // Label: A55A for command, 5AA5 for response
+  uint8_t iv_input[16];
+  memset(iv_input, 0, 16);
+
+  if (for_response) {
+    iv_input[0] = 0x5A; iv_input[1] = 0xA5;
+  } else {
+    iv_input[0] = 0xA5; iv_input[1] = 0x5A;
+  }
+  memcpy(iv_input + 2, ti_, 4);
+  iv_input[6] = (uint8_t)(cmd_ctr_ & 0xFF);
+  iv_input[7] = (uint8_t)((cmd_ctr_ >> 8) & 0xFF);
+  // bytes 8..15 are zero (padding)
+
+  aes_enc_block_(ses_auth_enc_rk_, iv_input, iv);
+  secure_zero_((volatile uint8_t *)iv_input, 16);
+}
+
+void DesfireReaderComponent::compute_cmd_mac_(uint8_t cmd, const uint8_t *cmd_data,
+                                               uint8_t data_len, uint8_t *mac8) {
+  // MAC input: Cmd || CmdCtr(2 LE) || TI(4) || CmdData
+  uint8_t mac_input[64];
+  uint8_t offset = 0;
+
+  mac_input[offset++] = cmd;
+  mac_input[offset++] = (uint8_t)(cmd_ctr_ & 0xFF);
+  mac_input[offset++] = (uint8_t)((cmd_ctr_ >> 8) & 0xFF);
+  memcpy(mac_input + offset, ti_, 4);
+  offset += 4;
+  if (data_len > 0 && data_len <= (sizeof(mac_input) - offset)) {
+    memcpy(mac_input + offset, cmd_data, data_len);
+    offset += data_len;
+  }
+
+  uint8_t full_mac[16];
+  aes_cmac_(ses_auth_mac_rk_, mac_input, offset, full_mac);
+  aes_cmac_truncate_(full_mac, mac8);
+
+  secure_zero_((volatile uint8_t *)mac_input, sizeof(mac_input));
+  secure_zero_((volatile uint8_t *)full_mac, 16);
+}
+
+bool DesfireReaderComponent::verify_resp_mac_(uint8_t sw2, const uint8_t *resp_data,
+                                               uint8_t data_len, const uint8_t *mac8) {
+  // MAC input: SW2 || CmdCtr(2 LE) || TI(4) || RespData
+  uint8_t mac_input[64];
+  uint8_t offset = 0;
+
+  mac_input[offset++] = sw2;
+  mac_input[offset++] = (uint8_t)(cmd_ctr_ & 0xFF);
+  mac_input[offset++] = (uint8_t)((cmd_ctr_ >> 8) & 0xFF);
+  memcpy(mac_input + offset, ti_, 4);
+  offset += 4;
+  if (data_len > 0 && data_len <= (sizeof(mac_input) - offset)) {
+    memcpy(mac_input + offset, resp_data, data_len);
+    offset += data_len;
+  }
+
+  uint8_t full_mac[16];
+  aes_cmac_(ses_auth_mac_rk_, mac_input, offset, full_mac);
+
+  uint8_t expected[8];
+  aes_cmac_truncate_(full_mac, expected);
+
+  // Constant-time comparison
+  uint8_t diff = 0;
+  for (uint8_t i = 0; i < 8; i++)
+    diff |= expected[i] ^ mac8[i];
+
+  secure_zero_((volatile uint8_t *)mac_input, sizeof(mac_input));
+  secure_zero_((volatile uint8_t *)full_mac, 16);
+  secure_zero_((volatile uint8_t *)expected, 8);
+
+  return diff == 0;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Setup
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::setup() {
-  ESP_LOGCONFIG(TAG, "DESFire reader setup...");
+  ESP_LOGCONFIG(TAG, "DESFire reader setup (EV2 secure channel)...");
   aes_key_exp_(app_key_, app_rk_);
-  aes_key_exp_(data_key_, data_rk_);
+  if (has_data_key_)
+    aes_key_exp_(data_key_, data_rk_);
 
   static const uint8_t wakeup[] = {
       0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -527,7 +693,6 @@ void DesfireReaderComponent::loop() {
 
     const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
     if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
-      // Write failed — bus might be stuck
       recover_i2c_bus_();
       pn532_wakeup_();
       state_ = NfcState::BUS_RECOVERY;
@@ -542,7 +707,6 @@ void DesfireReaderComponent::loop() {
 
   // ─────────────────────────────────────────────
   case NfcState::BUS_RECOVERY: {
-    // Wait for bus to settle after recovery, then go to IDLE
     if ((int32_t)(cooldown_until_ - now) > 0)
       return;
     state_ = NfcState::IDLE;
@@ -614,7 +778,7 @@ void DesfireReaderComponent::loop() {
         card_present_ = true;
         consecutive_fails_ = 0;
         retry_count_ = 0;
-        ESP_LOGI(TAG, "New card — starting DESFire workflow");
+        ESP_LOGI(TAG, "New card — starting DESFire EV2 workflow");
 
         start_select_app_();
         return;
@@ -659,9 +823,14 @@ void DesfireReaderComponent::loop() {
       if (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK) {
         ESP_LOGD(TAG, "SelectApp OK");
 
-        uint8_t apdu1[] = {0x90, 0xAA, 0x00, 0x00, 0x01, 0x00, 0x00};
+        // ┌─────────────────────────────────────────────────────┐
+        // │  AuthenticateEV2First (0x71) — replaces EV1 0xAA   │
+        // │  This establishes an EV2 secure channel with        │
+        // │  session keys, command counters, and TI binding.    │
+        // └─────────────────────────────────────────────────────┘
+        uint8_t apdu1[] = {0x90, 0x71, 0x00, 0x00, 0x01, 0x00, 0x00};
         if (!send_desfire_apdu_(apdu1, sizeof(apdu1))) {
-          ESP_LOGE(TAG, "Auth1 send failed");
+          ESP_LOGE(TAG, "Auth1 (EV2First) send failed");
           handle_retry_();
           return;
         }
@@ -710,26 +879,31 @@ void DesfireReaderComponent::loop() {
         return;
       }
 
+      // Card sent Enc(RndB) — decrypt with ECB (EV2 uses ECB for this step)
       memcpy(enc_rnd_b_, resp1, 16);
+      aes_dec_block_(app_rk_, enc_rnd_b_, rnd_b_dec_);
 
-      uint8_t rnd_b[16];
-      aes_dec_block_(app_rk_, enc_rnd_b_, rnd_b);
-
+      // Generate our random
       random_bytes_(rnd_a_, 16);
 
+      // Build RndB rotated left 1 byte
       uint8_t rnd_b_rot[16];
-      memcpy(rnd_b_rot, rnd_b + 1, 15);
-      rnd_b_rot[15] = rnd_b[0];
+      memcpy(rnd_b_rot, rnd_b_dec_ + 1, 15);
+      rnd_b_rot[15] = rnd_b_dec_[0];
 
-      uint8_t xor_buf[16];
-      for (uint8_t i = 0; i < 16; i++)
-        xor_buf[i] = rnd_a_[i] ^ enc_rnd_b_[i];
-      aes_enc_block_(app_rk_, xor_buf, token_);
+      // Construct plaintext: RndA || RndB'
+      uint8_t plain[32];
+      memcpy(plain, rnd_a_, 16);
+      memcpy(plain + 16, rnd_b_rot, 16);
 
-      for (uint8_t i = 0; i < 16; i++)
-        xor_buf[i] = rnd_b_rot[i] ^ token_[i];
-      aes_enc_block_(app_rk_, xor_buf, token_ + 16);
+      // Encrypt with AES-CBC, IV=0
+      uint8_t zero_iv[16] = {0};
+      aes_cbc_encrypt_with_key_(app_rk_, plain, 32, zero_iv, token_);
 
+      secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
+      secure_zero_((volatile uint8_t *)plain, 32);
+
+      // Send token: 90 AF 00 00 20 <32 bytes> 00
       uint8_t apdu2[38];
       apdu2[0] = 0x90;
       apdu2[1] = 0xAF;
@@ -738,10 +912,6 @@ void DesfireReaderComponent::loop() {
       apdu2[4] = 0x20;
       memcpy(apdu2 + 5, token_, 32);
       apdu2[37] = 0x00;
-
-      secure_zero_((volatile uint8_t *)rnd_b, 16);
-      secure_zero_((volatile uint8_t *)rnd_b_rot, 16);
-      secure_zero_((volatile uint8_t *)xor_buf, 16);
 
       if (!send_desfire_apdu_(apdu2, sizeof(apdu2))) {
         ESP_LOGE(TAG, "Auth2 send failed");
@@ -777,61 +947,68 @@ void DesfireReaderComponent::loop() {
 
   // ─────────────────────────────────────────────
   case NfcState::AUTH2_WAIT_RESP: {
-    uint8_t resp2[32];
+    uint8_t resp2[48];
     uint8_t resp2_len, sw1, sw2;
 
     if (read_desfire_apdu_(resp2, sizeof(resp2), resp2_len, sw1, sw2)) {
       if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
-        ESP_LOGE(TAG, "AES auth FAILED — wrong app key?");
+        ESP_LOGE(TAG, "AES auth FAILED — wrong app key? (sw2=0x%02X)", sw2);
         if (current_uid_str_[0] != '\0')
           publish_nonauthorised_uid_(current_uid_str_);
         handle_fail_();
         return;
       }
-      if (resp2_len != 16) {
-        ESP_LOGE(TAG, "Auth response wrong length (%d)", resp2_len);
+
+      // ┌─────────────────────────────────────────────────────┐
+      // │  EV2 auth response: 32 bytes encrypted              │
+      // │  Decrypt with AES-CBC, IV = last ciphertext block   │
+      // │  of our token (token_[16..31])                      │
+      // │  Contains: TI(4) || RndA'(16) || PDCap2(6) ||      │
+      // │            PCDCap2(6)                               │
+      // └─────────────────────────────────────────────────────┘
+      if (resp2_len != 32) {
+        ESP_LOGE(TAG, "Auth2 response wrong length (%d, expected 32)", resp2_len);
         handle_retry_();
         return;
       }
 
+      uint8_t decrypted[32];
+      // IV for decryption = last 16 bytes of the token we sent
+      aes_cbc_decrypt_with_key_(app_rk_, resp2, 32, token_ + 16, decrypted);
+
+      // Extract TI (Transaction Identifier)
+      memcpy(ti_, decrypted, 4);
+
+      // Extract and verify RndA' = rotate_left_1(RndA)
       uint8_t rnd_a_expected[16];
       memcpy(rnd_a_expected, rnd_a_ + 1, 15);
       rnd_a_expected[15] = rnd_a_[0];
 
-      uint8_t dec_tmp[16];
-      aes_dec_block_(app_rk_, resp2, dec_tmp);
-      uint8_t rnd_a_received[16];
-      for (uint8_t i = 0; i < 16; i++)
-        rnd_a_received[i] = dec_tmp[i] ^ token_[16 + i];
-
+      // Constant-time comparison
       uint8_t diff = 0;
       for (uint8_t i = 0; i < 16; i++)
-        diff |= rnd_a_received[i] ^ rnd_a_expected[i];
+        diff |= decrypted[4 + i] ^ rnd_a_expected[i];
 
       secure_zero_((volatile uint8_t *)rnd_a_expected, 16);
-      secure_zero_((volatile uint8_t *)rnd_a_received, 16);
-      secure_zero_((volatile uint8_t *)dec_tmp, 16);
+      secure_zero_((volatile uint8_t *)decrypted, 32);
 
       if (diff != 0) {
-        ESP_LOGE(TAG, "Mutual auth FAILED — RndA' mismatch");
+        ESP_LOGE(TAG, "Mutual auth FAILED — RndA' mismatch (EV2)");
         handle_fail_();
         return;
       }
 
-      ESP_LOGI(TAG, "Mutual AES auth verified — card is genuine");
+      // Derive EV2 session keys from RndA and RndB
+      derive_session_keys_();
 
-      uint8_t apdu[] = {
-          0x90, 0xBD, 0x00, 0x00, 0x07, 0x01,
-          0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00,
-          0x00};
-      if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
-        ESP_LOGE(TAG, "ReadFile send failed");
-        handle_retry_();
-        return;
+      ESP_LOGI(TAG, "Mutual AES EV2 auth verified — secure channel established");
+
+      // Next step: proximity check if enabled, otherwise read
+      if (proximity_check_enabled_) {
+        start_proximity_check_();
+      } else {
+        start_read_file_();
       }
-      state_ = NfcState::READ_WAIT_ACK;
-      state_entered_at_ = millis();
       return;
     }
 
@@ -843,7 +1020,193 @@ void DesfireReaderComponent::loop() {
     return;
   }
 
-  // ─────────────────────────────────────────────
+  // ═════════════════════════════════════════════
+  //  Proximity Check states
+  // ═════════════════════════════════════════════
+
+  case NfcState::PC_PREP_WAIT_ACK: {
+    if (try_read_ack_()) {
+      state_ = NfcState::PC_PREP_WAIT_RESP;
+      state_entered_at_ = millis();
+      return;
+    }
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "PreparePC ACK timeout — skipping proximity check");
+      // Proximity check failed — proceed to read anyway with warning
+      start_read_file_();
+    }
+    return;
+  }
+
+  case NfcState::PC_PREP_WAIT_RESP: {
+    uint8_t resp[16];
+    uint8_t resp_len, sw1, sw2;
+
+    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
+      if (sw2 != DESFIRE_MORE_FRAMES) {
+        ESP_LOGW(TAG, "PreparePC unexpected status (sw2=0x%02X) — skipping", sw2);
+        start_read_file_();
+        return;
+      }
+      // resp contains: Option(1) + pRndC(7) from the card
+      if (resp_len >= 8) {
+        memcpy(pc_rnd_c_, resp + 1, 7);  // Save initial card random part
+        // Note: these 7 bytes are the first part; each ProximityCheck round
+        // returns 1 more byte, but PreparePC already gives us the initial set.
+        // We'll overwrite pc_rnd_c_ with per-round bytes in the rounds.
+        memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);  // Will be filled per round
+      }
+      ESP_LOGD(TAG, "PreparePC OK — starting %d proximity check rounds", PC_NUM_ROUNDS);
+
+      // Start first round
+      pc_current_round_ = 0;
+      uint8_t apdu[] = {0x90, 0xF2, 0x00, 0x00, 0x01,
+                        pc_rnd_r_[0], 0x00};
+      if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
+        ESP_LOGW(TAG, "ProximityCheck round 0 send failed — skipping");
+        start_read_file_();
+        return;
+      }
+      state_ = NfcState::PC_ROUND_WAIT_ACK;
+      state_entered_at_ = millis();
+      return;
+    }
+
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "PreparePC resp timeout — skipping proximity check");
+      start_read_file_();
+    }
+    return;
+  }
+
+  case NfcState::PC_ROUND_WAIT_ACK: {
+    if (try_read_ack_()) {
+      state_ = NfcState::PC_ROUND_WAIT_RESP;
+      state_entered_at_ = millis();
+      return;
+    }
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "ProximityCheck round %d ACK timeout", pc_current_round_);
+      // On timeout during proximity check, fail — this could be a relay attack
+      ESP_LOGE(TAG, "Proximity check FAILED — possible relay attack");
+      handle_fail_();
+    }
+    return;
+  }
+
+  case NfcState::PC_ROUND_WAIT_RESP: {
+    uint8_t resp[4];
+    uint8_t resp_len, sw1, sw2;
+
+    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
+      if (sw2 != DESFIRE_MORE_FRAMES || resp_len < 1) {
+        ESP_LOGE(TAG, "ProximityCheck round %d bad response (sw2=0x%02X, len=%d)",
+                 pc_current_round_, sw2, resp_len);
+        ESP_LOGE(TAG, "Proximity check FAILED — card rejected round");
+        handle_fail_();
+        return;
+      }
+
+      // Save card's random byte for this round
+      pc_rnd_c_[pc_current_round_] = resp[0];
+      pc_current_round_++;
+
+      if (pc_current_round_ < PC_NUM_ROUNDS) {
+        // Send next round
+        uint8_t apdu[] = {0x90, 0xF2, 0x00, 0x00, 0x01,
+                          pc_rnd_r_[pc_current_round_], 0x00};
+        if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
+          ESP_LOGE(TAG, "ProximityCheck round %d send failed", pc_current_round_);
+          handle_fail_();
+          return;
+        }
+        state_ = NfcState::PC_ROUND_WAIT_ACK;
+        state_entered_at_ = millis();
+        return;
+      }
+
+      // All rounds done — send VerifyPC with MAC
+      // MAC input = pRndR(7) || pRndC(7)
+      uint8_t mac_input[14];
+      memcpy(mac_input, pc_rnd_r_, 7);
+      memcpy(mac_input + 7, pc_rnd_c_, 7);
+
+      uint8_t full_mac[16];
+      aes_cmac_(ses_auth_mac_rk_, mac_input, 14, full_mac);
+
+      uint8_t mac8[8];
+      aes_cmac_truncate_(full_mac, mac8);
+
+      secure_zero_((volatile uint8_t *)mac_input, 14);
+      secure_zero_((volatile uint8_t *)full_mac, 16);
+
+      // VerifyPC: 90 F5 00 00 08 <8 bytes MAC> 00
+      uint8_t apdu[14];
+      apdu[0] = 0x90;
+      apdu[1] = 0xF5;
+      apdu[2] = 0x00;
+      apdu[3] = 0x00;
+      apdu[4] = 0x08;
+      memcpy(apdu + 5, mac8, 8);
+      apdu[13] = 0x00;
+
+      if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
+        ESP_LOGE(TAG, "VerifyPC send failed");
+        handle_fail_();
+        return;
+      }
+      state_ = NfcState::PC_VERIFY_WAIT_ACK;
+      state_entered_at_ = millis();
+      return;
+    }
+
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
+      ESP_LOGE(TAG, "ProximityCheck round %d resp timeout", pc_current_round_);
+      ESP_LOGE(TAG, "Proximity check FAILED — timeout (possible relay?)");
+      handle_fail_();
+    }
+    return;
+  }
+
+  case NfcState::PC_VERIFY_WAIT_ACK: {
+    if (try_read_ack_()) {
+      state_ = NfcState::PC_VERIFY_WAIT_RESP;
+      state_entered_at_ = millis();
+      return;
+    }
+    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
+      ESP_LOGE(TAG, "VerifyPC ACK timeout");
+      handle_fail_();
+    }
+    return;
+  }
+
+  case NfcState::PC_VERIFY_WAIT_RESP: {
+    uint8_t resp[8];
+    uint8_t resp_len, sw1, sw2;
+
+    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
+      if (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK) {
+        ESP_LOGI(TAG, "Proximity check PASSED — card is physically close");
+        start_read_file_();
+        return;
+      }
+      ESP_LOGE(TAG, "Proximity check FAILED — card may be relayed (sw2=0x%02X)", sw2);
+      handle_fail_();
+      return;
+    }
+
+    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
+      ESP_LOGE(TAG, "VerifyPC resp timeout");
+      handle_fail_();
+    }
+    return;
+  }
+
+  // ═════════════════════════════════════════════
+  //  ReadData states
+  // ═════════════════════════════════════════════
+
   case NfcState::READ_WAIT_ACK: {
     if (try_read_ack_()) {
       state_ = NfcState::READ_WAIT_RESP;
@@ -859,7 +1222,7 @@ void DesfireReaderComponent::loop() {
 
   // ─────────────────────────────────────────────
   case NfcState::READ_WAIT_RESP: {
-    uint8_t resp[48];
+    uint8_t resp[64];
     uint8_t resp_len, sw1, sw2;
 
     if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
@@ -869,8 +1232,14 @@ void DesfireReaderComponent::loop() {
         return;
       }
 
+      if (resp_len > sizeof(raw_file_)) resp_len = sizeof(raw_file_);
       memcpy(raw_file_, resp, resp_len);
       raw_file_len_ = resp_len;
+
+      // Increment command counter after successful command-response
+      if (ev2_authenticated_)
+        cmd_ctr_++;
+
       state_ = NfcState::PUBLISH;
     } else {
       if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
@@ -884,37 +1253,145 @@ void DesfireReaderComponent::loop() {
 
   // ─────────────────────────────────────────────
   case NfcState::PUBLISH: {
-    uint8_t cipher_len = (raw_file_len_ / 16) * 16;
+    uint8_t decrypted[64];
+    uint8_t dec_len = 0;
 
-    if (cipher_len == 0 || cipher_len > 48) {
-      ESP_LOGE(TAG, "Bad cipher length (%d from %d raw)", cipher_len, raw_file_len_);
-      handle_fail_();
-      return;
+    if (ev2_authenticated_ && comm_mode_ == CommMode::FULL) {
+      // ┌─────────────────────────────────────────────────────┐
+      // │  CommMode FULL: response = EncData || CMAC(8)       │
+      // │  Decrypt with session ENC key, verify CMAC with     │
+      // │  session MAC key.                                   │
+      // └─────────────────────────────────────────────────────┘
+      if (raw_file_len_ < 24) {  // minimum: 16 enc + 8 mac
+        ESP_LOGE(TAG, "FULL mode response too short (%d)", raw_file_len_);
+        handle_fail_();
+        return;
+      }
+
+      uint8_t mac_len = 8;
+      uint8_t enc_len = raw_file_len_ - mac_len;
+      if (enc_len % 16 != 0) {
+        ESP_LOGE(TAG, "FULL mode encrypted data not block-aligned (%d)", enc_len);
+        handle_fail_();
+        return;
+      }
+
+      // Compute decryption IV from command counter and TI
+      // Note: cmd_ctr_ was already incremented above, so use (cmd_ctr_ - 1)
+      uint16_t saved_ctr = cmd_ctr_;
+      cmd_ctr_ = saved_ctr - 1;
+      uint8_t iv[16];
+      compute_ev2_iv_(true, iv);  // true = response IV
+      cmd_ctr_ = saved_ctr;
+
+      // Decrypt
+      aes_cbc_decrypt_with_key_(ses_auth_enc_rk_, raw_file_, enc_len, iv, decrypted);
+
+      // Strip ISO 9797-1 M2 padding (0x80 0x00...)
+      dec_len = enc_len;
+      while (dec_len > 0 && decrypted[dec_len - 1] == 0x00)
+        dec_len--;
+      if (dec_len > 0 && decrypted[dec_len - 1] == 0x80)
+        dec_len--;
+
+      // Verify response CMAC
+      uint16_t mac_ctr = saved_ctr - 1;
+      cmd_ctr_ = mac_ctr;
+      if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len,
+                            raw_file_ + enc_len)) {
+        ESP_LOGE(TAG, "FULL mode CMAC verification FAILED — data tampered?");
+        cmd_ctr_ = saved_ctr;
+        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+        handle_fail_();
+        return;
+      }
+      cmd_ctr_ = saved_ctr;
+
+      ESP_LOGD(TAG, "FULL mode: decrypted %d bytes, CMAC verified", dec_len);
+
+    } else if (ev2_authenticated_ && comm_mode_ == CommMode::MAC) {
+      // ┌─────────────────────────────────────────────────────┐
+      // │  CommMode MAC: response = Data || CMAC(8)           │
+      // │  Data is cleartext, verify CMAC integrity.          │
+      // └─────────────────────────────────────────────────────┘
+      if (raw_file_len_ < 9) {
+        ESP_LOGE(TAG, "MAC mode response too short (%d)", raw_file_len_);
+        handle_fail_();
+        return;
+      }
+
+      dec_len = raw_file_len_ - 8;
+      memcpy(decrypted, raw_file_, dec_len);
+
+      uint16_t saved_ctr = cmd_ctr_;
+      cmd_ctr_ = saved_ctr - 1;
+      if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len,
+                            raw_file_ + dec_len)) {
+        ESP_LOGE(TAG, "MAC mode CMAC verification FAILED — data tampered?");
+        cmd_ctr_ = saved_ctr;
+        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+        handle_fail_();
+        return;
+      }
+      cmd_ctr_ = saved_ctr;
+
+      // If data_key is configured, also decrypt locally
+      if (has_data_key_) {
+        uint8_t cipher_len = (dec_len / 16) * 16;
+        if (cipher_len > 0) {
+          uint8_t tmp[64];
+          uint8_t zero_iv[16] = {0};
+          aes_cbc_decrypt_with_key_(data_rk_, decrypted, cipher_len, zero_iv, tmp);
+          memcpy(decrypted, tmp, cipher_len);
+          dec_len = cipher_len;
+          secure_zero_((volatile uint8_t *)tmp, sizeof(tmp));
+        }
+      }
+
+      ESP_LOGD(TAG, "MAC mode: %d bytes, CMAC verified", dec_len);
+
+    } else {
+      // ┌─────────────────────────────────────────────────────┐
+      // │  CommMode PLAIN: legacy path                        │
+      // │  Data may be pre-encrypted with data_key.           │
+      // │  No session-level integrity protection on the read. │
+      // └─────────────────────────────────────────────────────┘
+      if (has_data_key_) {
+        uint8_t cipher_len = (raw_file_len_ / 16) * 16;
+        if (cipher_len == 0 || cipher_len > sizeof(decrypted)) {
+          ESP_LOGE(TAG, "Bad cipher length (%d from %d raw)", cipher_len, raw_file_len_);
+          handle_fail_();
+          return;
+        }
+        if (raw_file_len_ != cipher_len) {
+          ESP_LOGD(TAG, "Stripped %d trailing bytes", raw_file_len_ - cipher_len);
+        }
+        uint8_t zero_iv[16] = {0};
+        if (!aes_cbc_decrypt_with_key_(data_rk_, raw_file_, cipher_len, zero_iv, decrypted)) {
+          ESP_LOGE(TAG, "AES decrypt FAILED");
+          secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+          handle_fail_();
+          return;
+        }
+        dec_len = cipher_len;
+      } else {
+        // No data_key, no encryption — raw plaintext
+        memcpy(decrypted, raw_file_, raw_file_len_);
+        dec_len = raw_file_len_;
+      }
     }
 
-    if (raw_file_len_ != cipher_len) {
-      ESP_LOGD(TAG, "Stripped %d trailing bytes (CMAC)", raw_file_len_ - cipher_len);
-    }
-
-    uint8_t decrypted[48];
-    uint8_t zero_iv[16] = {0};
-    if (!aes_cbc_decrypt_(raw_file_, cipher_len, zero_iv, decrypted)) {
-      ESP_LOGE(TAG, "AES decrypt FAILED");
-      secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-      handle_fail_();
-      return;
-    }
-
+    // Extract printable ASCII result
     char result[49];
     uint8_t rlen = 0;
-    for (uint8_t i = 0; i < cipher_len && i < 48 &&
+    for (uint8_t i = 0; i < dec_len && i < 48 &&
          decrypted[i] >= 0x20 && decrypted[i] <= 0x7E; i++)
       result[rlen++] = (char)decrypted[i];
     result[rlen] = '\0';
 
     secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
 
-    ESP_LOGI(TAG, "Auth + read OK (%d bytes)", rlen);
+    ESP_LOGI(TAG, "Auth + read OK (%d bytes, mode=%d)", rlen, (int)comm_mode_);
 
     if (current_uid_str_[0] != '\0') {
       publish_uid_(current_uid_str_);
@@ -978,8 +1455,15 @@ void DesfireReaderComponent::loop() {
 }
 
 void DesfireReaderComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "DESFire Reader:");
+  ESP_LOGCONFIG(TAG, "DESFire Reader (EV2 Secure Channel):");
   ESP_LOGCONFIG(TAG, "  App ID: %02X:%02X:%02X", app_id_[0], app_id_[1], app_id_[2]);
+  ESP_LOGCONFIG(TAG, "  Auth: AuthenticateEV2First (0x71)");
+  ESP_LOGCONFIG(TAG, "  Comm mode: %s",
+                comm_mode_ == CommMode::FULL ? "Full (encrypted+CMAC)" :
+                comm_mode_ == CommMode::MAC  ? "MAC (integrity)" : "Plain (legacy)");
+  ESP_LOGCONFIG(TAG, "  Proximity check: %s",
+                proximity_check_enabled_ ? "enabled" : "disabled");
+  ESP_LOGCONFIG(TAG, "  Data key: %s", has_data_key_ ? "configured" : "not set");
   if (sda_pin_ >= 0 && scl_pin_ >= 0) {
     ESP_LOGCONFIG(TAG, "  SDA: GPIO%d  SCL: GPIO%d", sda_pin_, scl_pin_);
   } else {
@@ -990,7 +1474,7 @@ void DesfireReaderComponent::dump_config() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  AES-128 portable
+//  AES-128 portable (unchanged)
 // ═══════════════════════════════════════════════════════════════
 
 static const uint8_t AES_SBOX[256] PROGMEM = {
@@ -1112,9 +1596,86 @@ void aes_dec_block_(const uint8_t *rk, const uint8_t *in, uint8_t *out) {
   memcpy(out, s, 16);
 }
 
-bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
-                                              const uint8_t *iv_in,
-                                              uint8_t *out) {
+// ═══════════════════════════════════════════════════════════════
+//  AES-CMAC (NIST SP 800-38B)
+// ═══════════════════════════════════════════════════════════════
+
+static void aes_cmac_subkeys_(const uint8_t *rk, uint8_t *K1, uint8_t *K2) {
+  uint8_t L[16] = {0};
+  aes_enc_block_(rk, L, L);  // L = Enc(K, zeros)
+
+  // K1 = L << 1; if MSB(L) == 1 then K1 ^= 0x87
+  uint8_t msb = L[0] & 0x80;
+  for (int i = 0; i < 15; i++)
+    K1[i] = (L[i] << 1) | (L[i + 1] >> 7);
+  K1[15] = L[15] << 1;
+  if (msb) K1[15] ^= 0x87;
+
+  // K2 = K1 << 1; if MSB(K1) == 1 then K2 ^= 0x87
+  msb = K1[0] & 0x80;
+  for (int i = 0; i < 15; i++)
+    K2[i] = (K1[i] << 1) | (K1[i + 1] >> 7);
+  K2[15] = K1[15] << 1;
+  if (msb) K2[15] ^= 0x87;
+}
+
+void aes_cmac_(const uint8_t *rk, const uint8_t *msg, uint16_t msg_len,
+               uint8_t *mac) {
+  uint8_t K1[16], K2[16];
+  aes_cmac_subkeys_(rk, K1, K2);
+
+  int n = (msg_len + 15) / 16;
+  if (n == 0) n = 1;
+  bool complete = (msg_len > 0 && msg_len % 16 == 0);
+
+  uint8_t X[16] = {0};  // CBC-MAC state
+
+  // Process all blocks except the last
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < 16; j++)
+      X[j] ^= msg[i * 16 + j];
+    aes_enc_block_(rk, X, X);
+  }
+
+  // Last block
+  uint8_t last[16];
+  if (complete) {
+    memcpy(last, msg + (n - 1) * 16, 16);
+    for (int j = 0; j < 16; j++)
+      last[j] ^= K1[j];
+  } else {
+    memset(last, 0, 16);
+    uint8_t remain = msg_len - (n - 1) * 16;
+    if (remain > 0)
+      memcpy(last, msg + (n - 1) * 16, remain);
+    last[remain] = 0x80;  // ISO padding
+    for (int j = 0; j < 16; j++)
+      last[j] ^= K2[j];
+  }
+
+  for (int j = 0; j < 16; j++)
+    X[j] ^= last[j];
+  aes_enc_block_(rk, X, mac);
+
+  DesfireReaderComponent::secure_zero_((volatile uint8_t *)K1, 16);
+  DesfireReaderComponent::secure_zero_((volatile uint8_t *)K2, 16);
+  DesfireReaderComponent::secure_zero_((volatile uint8_t *)last, 16);
+}
+
+void aes_cmac_truncate_(const uint8_t *full_mac, uint8_t *mac8) {
+  // DESFire EV2 truncation: take odd-indexed bytes (1,3,5,7,9,11,13,15)
+  for (uint8_t i = 0; i < 8; i++)
+    mac8[i] = full_mac[2 * i + 1];
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  AES-CBC encrypt/decrypt with explicit key
+// ═══════════════════════════════════════════════════════════════
+
+bool DesfireReaderComponent::aes_cbc_decrypt_with_key_(const uint8_t *rk,
+                                                        const uint8_t *in, uint8_t len,
+                                                        const uint8_t *iv_in,
+                                                        uint8_t *out) {
   if (len % 16 != 0)
     return false;
   uint8_t iv[16];
@@ -1123,10 +1684,31 @@ bool DesfireReaderComponent::aes_cbc_decrypt_(const uint8_t *in, uint8_t len,
   else
     memset(iv, 0, 16);
   for (uint8_t b = 0; b < len; b += 16) {
-    aes_dec_block_(data_rk_, in + b, out + b);
+    aes_dec_block_(rk, in + b, out + b);
     for (uint8_t i = 0; i < 16; i++)
       out[b + i] ^= iv[i];
     memcpy(iv, in + b, 16);
+  }
+  return true;
+}
+
+bool DesfireReaderComponent::aes_cbc_encrypt_with_key_(const uint8_t *rk,
+                                                        const uint8_t *in, uint8_t len,
+                                                        const uint8_t *iv_in,
+                                                        uint8_t *out) {
+  if (len % 16 != 0)
+    return false;
+  uint8_t iv[16];
+  if (iv_in != nullptr)
+    memcpy(iv, iv_in, 16);
+  else
+    memset(iv, 0, 16);
+  for (uint8_t b = 0; b < len; b += 16) {
+    uint8_t block[16];
+    for (uint8_t i = 0; i < 16; i++)
+      block[i] = in[b + i] ^ iv[i];
+    aes_enc_block_(rk, block, out + b);
+    memcpy(iv, out + b, 16);
   }
   return true;
 }
