@@ -1657,9 +1657,9 @@ void aes_cmac_(const uint8_t *rk, const uint8_t *msg, uint16_t msg_len,
     X[j] ^= last[j];
   aes_enc_block_(rk, X, mac);
 
-  DesfireReaderComponent::secure_zero_((volatile uint8_t *)K1, 16);
-  DesfireReaderComponent::secure_zero_((volatile uint8_t *)K2, 16);
-  DesfireReaderComponent::secure_zero_((volatile uint8_t *)last, 16);
+  for (int i = 0; i < 16; i++) { ((volatile uint8_t *)K1)[i] = 0; }
+  for (int i = 0; i < 16; i++) { ((volatile uint8_t *)K2)[i] = 0; }
+  for (int i = 0; i < 16; i++) { ((volatile uint8_t *)last)[i] = 0; }
 }
 
 void aes_cmac_truncate_(const uint8_t *full_mac, uint8_t *mac8) {
