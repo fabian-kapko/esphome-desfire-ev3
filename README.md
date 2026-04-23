@@ -18,7 +18,7 @@ Implements the **EV2 secure channel** (`AuthenticateEV2First`, cmd `0x71`) with 
 
 | Component | Notes |
 |-----------|-------|
-| ESP32 | Any ESPHome-supported board with I2C |
+| ESP32 | Any ESPHome-supported board with I2C (must be an arduino framework, if you have specific boards, most will work with just generic ESP32 variant without specifing other details) |
 | PN532 NFC module | I2C mode (set DIP switches to I2C), default address `0x24` |
 
 Wire the PN532 to your ESP32's I2C bus (SDA/SCL). The component auto-configures the PN532 at startup.
