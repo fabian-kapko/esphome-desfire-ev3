@@ -11,6 +11,7 @@ Implements the **EV2 secure channel** (`AuthenticateEV2First`, cmd `0x71`) with 
 - **CMAC integrity** — response MAC verified over ciphertext, tamper detection on every read
 - **Three comm modes** — Full (encrypted + CMAC), MAC (cleartext + CMAC), Plain (legacy)
 - **Self-contained PN532 driver** — speaks the PN532 I2C frame protocol directly
+- **Dedicated PN532 task** — the state machine runs on its own FreeRTOS task pinned to core 1 (core 0 on single-core chips), so I2C waits never stall the ESPHome main loop or WiFi's core
 - **Non-destructive error handling** — card rejections back off without touching the I2C bus; a silent PN532 is retried with backoff and logged as an error
 - **Portable AES-128** — software implementation, no external crypto libraries
 

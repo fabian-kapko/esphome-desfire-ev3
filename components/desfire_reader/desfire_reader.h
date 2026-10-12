@@ -11,6 +11,9 @@
 
 #ifdef USE_ESP32
 #include <esp_random.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #endif
 
 namespace esphome {
@@ -39,6 +42,25 @@ static const uint8_t MAX_RETRIES = 2;
 // Consecutive exchanges without a valid PN532 frame before the reader backs
 // off hard and logs an error
 static const uint8_t SILENT_EXCHANGE_LIMIT = 5;
+
+#ifdef USE_ESP32
+// The PN532 state machine runs on its own task. Core 1 keeps it off core 0,
+// which runs WiFi and (on ESP-IDF) the main task by default. Single-core chips
+// (ESP32-C6) only have core 0.
+#if CONFIG_FREERTOS_UNICORE
+static const BaseType_t DESFIRE_TASK_CORE = 0;
+#else
+static const BaseType_t DESFIRE_TASK_CORE = 1;
+#endif
+static const uint32_t DESFIRE_TASK_STACK = 4096;
+static const UBaseType_t DESFIRE_TASK_PRIORITY = 1;
+#endif
+
+// Bits in PendingPublish::dirty
+static const uint8_t PUB_UID = 1;
+static const uint8_t PUB_NONAUTH = 2;
+static const uint8_t PUB_RESULT = 4;
+static const uint8_t PUB_AUTH = 8;
 
 // File communication modes (matches DESFire spec)
 enum class CommMode : uint8_t {
@@ -81,7 +103,8 @@ enum class ApduResult : uint8_t {
 class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
  public:
   void setup() override;
-  void update() override;
+  // Polling is paced by the PN532 task, not by the ESPHome scheduler
+  void update() override {}
   void loop() override;
   void dump_config() override;
 
@@ -166,6 +189,20 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void start_read_file_();
   void pn532_wakeup_();
 
+  // ── PN532 task and publishing ──
+  void poll_();  // One step of the PN532 state machine
+#ifdef USE_ESP32
+  static void poll_task_entry_(void *arg);
+  void poll_task_();
+#endif
+  // Called from the PN532 task: store the value, loop() publishes it
+  void queue_uid_(const char *uid_str);
+  void queue_nonauthorised_uid_(const char *uid_str);
+  void queue_result_(const char *str);
+  void queue_auth_(bool state);
+  // Called from loop() on the ESPHome main task
+  void flush_pending_();
+
   // ── Configuration ──
   uint8_t app_id_[3]{0xA1, 0xB2, 0xC3};
   uint8_t app_key_[16]{};
@@ -186,11 +223,26 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   char last_result_[50]{};
   bool last_auth_{false};
 
+  // ── Values queued by the PN532 task, published by loop() ──
+  struct PendingPublish {
+    char uid[24];
+    char nonauthorised_uid[24];
+    char result[50];
+    bool auth;
+    uint8_t dirty;  // PUB_* bits
+  };
+  PendingPublish pending_{};
+#ifdef USE_ESP32
+  SemaphoreHandle_t pending_lock_{nullptr};
+  TaskHandle_t task_handle_{nullptr};
+#endif
+  uint32_t poll_interval_ms_{50};
+  uint32_t last_poll_ms_{0};
+
   // ── State machine ──
   NfcState state_{NfcState::IDLE};
   uint32_t cooldown_until_{0};
   uint32_t state_entered_at_{0};
-  bool update_requested_{false};
 
   uint8_t prev_uid_[7]{};
   uint8_t prev_uid_len_{0};

@@ -6,6 +6,23 @@
 namespace esphome {
 namespace desfire_reader {
 
+// pending_ is shared between the PN532 task and loop(). Off ESP32 there is no
+// task, so the lock is not needed.
+#ifdef USE_ESP32
+#define PENDING_LOCK() xSemaphoreTake(pending_lock_, portMAX_DELAY)
+#define PENDING_UNLOCK() xSemaphoreGive(pending_lock_)
+#else
+#define PENDING_LOCK() ((void) 0)
+#define PENDING_UNLOCK() ((void) 0)
+#endif
+
+static void copy_str_(char *dst, size_t cap, const char *src) {
+  size_t len = strlen(src);
+  if (len >= cap) len = cap - 1;
+  memcpy(dst, src, len);
+  dst[len] = '\0';
+}
+
 void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
   for (uint8_t i = 0; i < len; i++)
     buf[i] = 0;
@@ -218,7 +235,7 @@ void DesfireReaderComponent::note_nonauthorised_failure_() {
            nonauthorised_fail_count_);
 
   if (nonauthorised_fail_count_ >= 2 && current_uid_str_[0] != '\0')
-    publish_nonauthorised_uid_(current_uid_str_);
+    queue_nonauthorised_uid_(current_uid_str_);
 }
 
 void DesfireReaderComponent::publish_auth_(bool state) {
@@ -240,6 +257,53 @@ void DesfireReaderComponent::publish_result_(const char *str) {
   }
 }
 
+// Queue side: called from the PN532 task. Only the latest value per sensor is
+// kept, which is all a sensor needs.
+void DesfireReaderComponent::queue_uid_(const char *uid_str) {
+  PENDING_LOCK();
+  copy_str_(pending_.uid, sizeof(pending_.uid), uid_str);
+  pending_.dirty |= PUB_UID;
+  PENDING_UNLOCK();
+}
+
+void DesfireReaderComponent::queue_nonauthorised_uid_(const char *uid_str) {
+  PENDING_LOCK();
+  copy_str_(pending_.nonauthorised_uid, sizeof(pending_.nonauthorised_uid), uid_str);
+  pending_.dirty |= PUB_NONAUTH;
+  PENDING_UNLOCK();
+}
+
+void DesfireReaderComponent::queue_result_(const char *str) {
+  PENDING_LOCK();
+  copy_str_(pending_.result, sizeof(pending_.result), str);
+  pending_.dirty |= PUB_RESULT;
+  PENDING_UNLOCK();
+}
+
+void DesfireReaderComponent::queue_auth_(bool state) {
+  PENDING_LOCK();
+  pending_.auth = state;
+  pending_.dirty |= PUB_AUTH;
+  PENDING_UNLOCK();
+}
+
+// Drain side: called from loop() on the ESPHome main task
+void DesfireReaderComponent::flush_pending_() {
+  PendingPublish snap;
+  PENDING_LOCK();
+  snap = pending_;
+  pending_.dirty = 0;
+  PENDING_UNLOCK();
+
+  if (snap.dirty == 0)
+    return;
+  // Result before auth: the auth_ok on_press action reads the result sensor
+  if (snap.dirty & PUB_UID) publish_uid_(snap.uid);
+  if (snap.dirty & PUB_NONAUTH) publish_nonauthorised_uid_(snap.nonauthorised_uid);
+  if (snap.dirty & PUB_RESULT) publish_result_(snap.result);
+  if (snap.dirty & PUB_AUTH) publish_auth_(snap.auth);
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  State machine helpers
 // ═══════════════════════════════════════════════════════════════
@@ -250,7 +314,7 @@ void DesfireReaderComponent::handle_fail_() {
   for (uint8_t i = 1; i < consecutive_fails_ && delay_ms < COOLDOWN_FAIL_MAX_MS; i++)
     delay_ms = (delay_ms * 2 > COOLDOWN_FAIL_MAX_MS) ? COOLDOWN_FAIL_MAX_MS : delay_ms * 2;
   ESP_LOGD(TAG, "Hard fail #%d — cooldown %lu ms", consecutive_fails_, (unsigned long)delay_ms);
-  publish_auth_(false);
+  queue_auth_(false);
   retry_count_ = 0;
   prev_uid_len_ = 0;
   // Application-level failure (card rejected, bad MAC, ...): the PN532 and the
@@ -299,10 +363,10 @@ void DesfireReaderComponent::clear_card_state_() {
   nonauthorised_fail_count_ = 0;
   consecutive_fails_ = 0;
   ev2_authenticated_ = false;
-  publish_auth_(false);
-  publish_result_("");
-  publish_uid_("");
-  publish_nonauthorised_uid_("");
+  queue_auth_(false);
+  queue_result_("");
+  queue_uid_("");
+  queue_nonauthorised_uid_("");
   ESP_LOGD(TAG, "Card removed");
 }
 
@@ -482,6 +546,15 @@ bool DesfireReaderComponent::verify_resp_mac_(uint8_t sw2, const uint8_t *resp_d
 
 void DesfireReaderComponent::setup() {
   ESP_LOGCONFIG(TAG, "DESFire reader setup (EV2 secure channel)...");
+  poll_interval_ms_ = this->get_update_interval();
+#ifdef USE_ESP32
+  pending_lock_ = xSemaphoreCreateMutex();
+  if (pending_lock_ == nullptr) {
+    ESP_LOGE(TAG, "Could not create the publish lock");
+    this->mark_failed();
+    return;
+  }
+#endif
   aes_key_exp_(app_key_, app_rk_);
   if (has_data_key_)
     aes_key_exp_(data_key_, data_rk_);
@@ -567,24 +640,49 @@ void DesfireReaderComponent::setup() {
 
   state_ = NfcState::IDLE;
   cooldown_until_ = 0;
-  update_requested_ = false;
   ESP_LOGCONFIG(TAG, "PN532 initialized.");
+
+#ifdef USE_ESP32
+  // From here on the state machine runs on its own task
+  if (xTaskCreatePinnedToCore(poll_task_entry_, "desfire", DESFIRE_TASK_STACK, this,
+                              DESFIRE_TASK_PRIORITY, &task_handle_, DESFIRE_TASK_CORE) != pdPASS) {
+    ESP_LOGE(TAG, "Could not start the PN532 task");
+    this->mark_failed();
+    return;
+  }
+  ESP_LOGCONFIG(TAG, "PN532 task running on core %d", (int) DESFIRE_TASK_CORE);
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  update() — just flags "time to poll"
+//  PN532 task and ESPHome loop()
 // ═══════════════════════════════════════════════════════════════
 
-void DesfireReaderComponent::update() {
-  if (state_ == NfcState::IDLE)
-    update_requested_ = true;
+#ifdef USE_ESP32
+void DesfireReaderComponent::poll_task_entry_(void *arg) {
+  static_cast<DesfireReaderComponent *>(arg)->poll_task_();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  loop() — non-blocking state machine
-// ═══════════════════════════════════════════════════════════════
+void DesfireReaderComponent::poll_task_() {
+  for (;;) {
+    poll_();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+#endif
 
 void DesfireReaderComponent::loop() {
+  flush_pending_();
+#ifndef USE_ESP32
+  poll_();  // No PN532 task off ESP32, so run the state machine inline
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  poll_() — one step of the PN532 state machine
+// ═══════════════════════════════════════════════════════════════
+
+void DesfireReaderComponent::poll_() {
   uint32_t now = millis();
 
   switch (state_) {
@@ -593,13 +691,9 @@ void DesfireReaderComponent::loop() {
   case NfcState::IDLE: {
     if ((int32_t)(cooldown_until_ - now) > 0)
       return;
-
-    if (!update_requested_) {
-      update_requested_ = true;
+    if (now - last_poll_ms_ < poll_interval_ms_)
       return;
-    }
-
-    update_requested_ = false;
+    last_poll_ms_ = now;
 
     const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
     if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
@@ -617,7 +711,6 @@ void DesfireReaderComponent::loop() {
     if ((int32_t)(cooldown_until_ - now) > 0)
       return;
     state_ = NfcState::IDLE;
-    update_requested_ = true;
     return;
   }
 
@@ -886,7 +979,7 @@ void DesfireReaderComponent::loop() {
       if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
         ESP_LOGE(TAG, "AES auth FAILED — wrong app key? (sw2=0x%02X)", sw2);
         if (current_uid_str_[0] != '\0')
-          publish_nonauthorised_uid_(current_uid_str_);
+          queue_nonauthorised_uid_(current_uid_str_);
         handle_fail_();
         return;
       }
@@ -1130,11 +1223,11 @@ void DesfireReaderComponent::loop() {
     ESP_LOGI(TAG, "Auth + read OK (%d bytes, mode=%d)", rlen, (int)comm_mode_);
 
     if (current_uid_str_[0] != '\0') {
-      publish_uid_(current_uid_str_);
-      publish_nonauthorised_uid_("");
+      queue_uid_(current_uid_str_);
+      queue_nonauthorised_uid_("");
     }
-    publish_auth_(true);
-    publish_result_(result);
+    queue_auth_(true);
+    queue_result_(result);
 
     secure_zero_((volatile uint8_t *)result, sizeof(result));
 
