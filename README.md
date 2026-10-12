@@ -11,7 +11,7 @@ Implements the **EV2 secure channel** (`AuthenticateEV2First`, cmd `0x71`) with 
 - **CMAC integrity** — response MAC verified over ciphertext, tamper detection on every read
 - **Three comm modes** — Full (encrypted + CMAC), MAC (cleartext + CMAC), Plain (legacy)
 - **Self-contained PN532 driver** — speaks the PN532 I2C frame protocol directly
-- **I2C bus recovery** — automatic SDA/SCL bit-bang recovery on bus lockups
+- **Non-destructive error handling** — card rejections back off without touching the I2C bus; a silent PN532 is retried with backoff and logged as an error
 - **Portable AES-128** — software implementation, no external crypto libraries
 
 ## Hardware
@@ -164,7 +164,7 @@ The component implements the PN532 I2C frame protocol directly (preamble · star
 
 - No `pn532_i2c:` entry needed in YAML
 - No conflict with other PN532-based components
-- Automatic I2C bus recovery if SDA gets stuck low
+- No SDA/SCL bit-banging: the I2C bus stays owned by ESPHome's `i2c:` component
 
 ## Security
 

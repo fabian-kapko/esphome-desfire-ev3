@@ -12,68 +12,26 @@ void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  I2C bus recovery — clock out stuck slave, re-init hardware
+//  PN532 wakeup and error accounting
 // ═══════════════════════════════════════════════════════════════
 
-void DesfireReaderComponent::recover_i2c_bus_() {
-#ifdef USE_ESP32
-  if (sda_pin_ < 0 || scl_pin_ < 0) {
-    ESP_LOGW(TAG, "I2C bus recovery skipped — SDA/SCL pins not configured");
-    delay(10);
-    return;
-  }
+// The I2C bus is owned by ESPHome's i2c component. Do not drive SDA/SCL from
+// here: gpio_reset_pin() detaches the pins from the I2C peripheral and nothing
+// re-attaches them, so every later transaction times out until reboot.
+void DesfireReaderComponent::pn532_responded_() {
+  if (silent_exchanges_ >= SILENT_EXCHANGE_LIMIT)
+    ESP_LOGI(TAG, "PN532 responding again");
+  silent_exchanges_ = 0;
+}
 
-  gpio_num_t sda = (gpio_num_t)sda_pin_;
-  gpio_num_t scl = (gpio_num_t)scl_pin_;
-
-  gpio_reset_pin(sda);
-  gpio_set_direction(sda, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
-  delayMicroseconds(20);
-
-  if (gpio_get_level(sda) != 0) {
-    gpio_reset_pin(sda);
-    ESP_LOGD(TAG, "I2C bus recovery: SDA already free — skipping clock-out");
-    uint8_t dummy;
-    this->read(&dummy, 1);
-    return;
-  }
-
-  ESP_LOGW(TAG, "I2C bus recovery — SDA stuck low, clocking out "
-           "(SDA=GPIO%d SCL=GPIO%d). Other I2C devices on this bus may be "
-           "briefly interrupted.", sda_pin_, scl_pin_);
-
-  gpio_reset_pin(scl);
-  gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
-  gpio_set_level(scl, 1);
-
-  for (int i = 0; i < 9; i++) {
-    gpio_set_level(scl, 0);
-    delayMicroseconds(5);
-    gpio_set_level(scl, 1);
-    delayMicroseconds(5);
-    if (gpio_get_level(sda) == 1)
-      break;
-  }
-
-  gpio_set_direction(sda, GPIO_MODE_OUTPUT_OD);
-  gpio_set_level(sda, 0);
-  delayMicroseconds(5);
-  gpio_set_level(scl, 1);
-  delayMicroseconds(5);
-  gpio_set_level(sda, 1);
-  delayMicroseconds(5);
-
-  gpio_set_direction(scl, GPIO_MODE_INPUT_OUTPUT_OD);
-  gpio_set_level(scl, 1);
-  gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
-  gpio_set_level(sda, 1);
-
-  uint8_t dummy;
-  this->read(&dummy, 1);
-#else
-  delay(10);
-#endif
+uint32_t DesfireReaderComponent::note_silent_exchange_() {
+  if (silent_exchanges_ < 255) silent_exchanges_++;
+  if (silent_exchanges_ == SILENT_EXCHANGE_LIMIT)
+    ESP_LOGE(TAG, "PN532 not answering after %d exchanges — check I2C wiring, "
+             "power and pull-ups", SILENT_EXCHANGE_LIMIT);
+  pn532_wakeup_();
+  return (silent_exchanges_ >= SILENT_EXCHANGE_LIMIT) ? COOLDOWN_FAIL_MAX_MS
+                                                       : COOLDOWN_RETRY_MS;
 }
 
 void DesfireReaderComponent::pn532_wakeup_() {
@@ -121,8 +79,11 @@ bool DesfireReaderComponent::try_read_ack_() {
   uint8_t ack[7];
   if (this->read(ack, 7) != i2c::ERROR_OK || ack[0] != 0x01)
     return false;
-  return (ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
-          ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00);
+  if (!(ack[1] == 0x00 && ack[2] == 0x00 && ack[3] == 0xFF &&
+        ack[4] == 0x00 && ack[5] == 0xFF && ack[6] == 0x00))
+    return false;
+  pn532_responded_();
+  return true;
 }
 
 bool DesfireReaderComponent::try_read_response_(uint8_t command,
@@ -164,6 +125,7 @@ bool DesfireReaderComponent::try_read_response_(uint8_t command,
   uint8_t copy_len = (payload_len <= resp_cap) ? payload_len : resp_cap;
   memcpy(resp, buf + 8, copy_len);
   resp_len = copy_len;
+  pn532_responded_();
   return true;
 }
 
@@ -181,20 +143,22 @@ bool DesfireReaderComponent::send_desfire_apdu_(const uint8_t *apdu, uint8_t apd
   return this->write_command_(cmd, 2 + apdu_len);
 }
 
-bool DesfireReaderComponent::read_desfire_apdu_(uint8_t *response, uint8_t resp_cap,
-                                                 uint8_t &resp_len, uint8_t &sw1,
-                                                 uint8_t &sw2) {
+ApduResult DesfireReaderComponent::read_desfire_apdu_(uint8_t *response, uint8_t resp_cap,
+                                                       uint8_t &resp_len, uint8_t &sw1,
+                                                       uint8_t &sw2) {
   resp_len = 0;
   uint8_t raw[PN532_BUF_SIZE];
   uint8_t raw_len;
 
   if (!this->try_read_response_(PN532_CMD_IN_DATA_EXCHANGE, raw, sizeof(raw), raw_len))
-    return false;
+    return ApduResult::NOT_READY;
 
-  if (raw_len == 0 || raw[0] != 0x00)
-    return false;
-  if (raw_len < 3)
-    return false;
+  // PN532 status 0x00 means the exchange worked. Any other status (card lost,
+  // RF collision, ...) is reported now instead of waiting for a timeout.
+  if (raw_len < 3 || raw[0] != 0x00) {
+    ESP_LOGD(TAG, "PN532 InDataExchange status 0x%02X (%d bytes)", raw_len ? raw[0] : 0, raw_len);
+    return ApduResult::PN532_ERROR;
+  }
 
   sw1 = raw[raw_len - 2];
   sw2 = raw[raw_len - 1];
@@ -204,7 +168,7 @@ bool DesfireReaderComponent::read_desfire_apdu_(uint8_t *response, uint8_t resp_
   if (copy_len > 0)
     memcpy(response, raw + 1, copy_len);
   resp_len = copy_len;
-  return true;
+  return ApduResult::OK;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -289,22 +253,9 @@ void DesfireReaderComponent::handle_fail_() {
   publish_auth_(false);
   retry_count_ = 0;
   prev_uid_len_ = 0;
-  ev2_authenticated_ = false;
-
-  recover_i2c_bus_();
-  pn532_wakeup_();
-
-  state_ = NfcState::BUS_RECOVERY;
-  state_entered_at_ = millis();
-  cooldown_until_ = millis() + delay_ms;
-  secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
-  secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
-  secure_zero_((volatile uint8_t *)rnd_b_dec_, sizeof(rnd_b_dec_));
-  secure_zero_((volatile uint8_t *)token_, sizeof(token_));
-  secure_zero_((volatile uint8_t *)ses_auth_enc_key_, sizeof(ses_auth_enc_key_));
-  secure_zero_((volatile uint8_t *)ses_auth_mac_key_, sizeof(ses_auth_mac_key_));
-  secure_zero_((volatile uint8_t *)ses_auth_enc_rk_, sizeof(ses_auth_enc_rk_));
-  secure_zero_((volatile uint8_t *)ses_auth_mac_rk_, sizeof(ses_auth_mac_rk_));
+  // Application-level failure (card rejected, bad MAC, ...): the PN532 and the
+  // bus are healthy, so only back off.
+  reset_to_idle_(delay_ms);
 }
 
 void DesfireReaderComponent::handle_retry_() {
@@ -314,30 +265,22 @@ void DesfireReaderComponent::handle_retry_() {
     handle_fail_();
     return;
   }
-  ESP_LOGD(TAG, "Retry %d/%d — recovering bus", retry_count_, MAX_RETRIES);
-  ev2_authenticated_ = false;
-  secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
-  secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
-  secure_zero_((volatile uint8_t *)rnd_b_dec_, sizeof(rnd_b_dec_));
-  secure_zero_((volatile uint8_t *)token_, sizeof(token_));
-  secure_zero_((volatile uint8_t *)ses_auth_enc_key_, sizeof(ses_auth_enc_key_));
-  secure_zero_((volatile uint8_t *)ses_auth_mac_key_, sizeof(ses_auth_mac_key_));
-  secure_zero_((volatile uint8_t *)ses_auth_enc_rk_, sizeof(ses_auth_enc_rk_));
-  secure_zero_((volatile uint8_t *)ses_auth_mac_rk_, sizeof(ses_auth_mac_rk_));
-
-  recover_i2c_bus_();
-  pn532_wakeup_();
-
+  ESP_LOGD(TAG, "Retry %d/%d", retry_count_, MAX_RETRIES);
+  wipe_session_();
   prev_uid_len_ = 0;
+  // Transport-level retry: wake the PN532 and wait. Never touches the pins.
   state_ = NfcState::BUS_RECOVERY;
   state_entered_at_ = millis();
-  cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
+  cooldown_until_ = millis() + note_silent_exchange_();
 }
 
 void DesfireReaderComponent::reset_to_idle_(uint32_t cooldown_ms) {
   state_ = NfcState::IDLE;
   cooldown_until_ = millis() + cooldown_ms;
-  ev2_authenticated_ = false;
+  wipe_session_();
+}
+
+void DesfireReaderComponent::wipe_session_() {
   secure_zero_((volatile uint8_t *)enc_rnd_b_, sizeof(enc_rnd_b_));
   secure_zero_((volatile uint8_t *)rnd_a_, sizeof(rnd_a_));
   secure_zero_((volatile uint8_t *)rnd_b_dec_, sizeof(rnd_b_dec_));
@@ -346,6 +289,7 @@ void DesfireReaderComponent::reset_to_idle_(uint32_t cooldown_ms) {
   secure_zero_((volatile uint8_t *)ses_auth_mac_key_, sizeof(ses_auth_mac_key_));
   secure_zero_((volatile uint8_t *)ses_auth_enc_rk_, sizeof(ses_auth_enc_rk_));
   secure_zero_((volatile uint8_t *)ses_auth_mac_rk_, sizeof(ses_auth_mac_rk_));
+  ev2_authenticated_ = false;
 }
 
 void DesfireReaderComponent::clear_card_state_() {
@@ -353,28 +297,13 @@ void DesfireReaderComponent::clear_card_state_() {
   prev_uid_len_ = 0;
   retry_count_ = 0;
   nonauthorised_fail_count_ = 0;
+  consecutive_fails_ = 0;
   ev2_authenticated_ = false;
   publish_auth_(false);
   publish_result_("");
   publish_uid_("");
   publish_nonauthorised_uid_("");
   ESP_LOGD(TAG, "Card removed");
-}
-
-void DesfireReaderComponent::start_release_() {
-  const uint8_t release_cmd[] = {PN532_CMD_IN_RELEASE, 0x01};
-  if (this->write_command_(release_cmd, sizeof(release_cmd))) {
-    state_ = NfcState::RELEASE_WAIT_ACK;
-    state_entered_at_ = millis();
-  } else {
-    ESP_LOGW(TAG, "Release send failed — recovering bus");
-    recover_i2c_bus_();
-    pn532_wakeup_();
-    prev_uid_len_ = 0;
-    state_ = NfcState::BUS_RECOVERY;
-    state_entered_at_ = millis();
-    cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
-  }
 }
 
 void DesfireReaderComponent::start_select_app_() {
@@ -639,11 +568,7 @@ void DesfireReaderComponent::setup() {
   state_ = NfcState::IDLE;
   cooldown_until_ = 0;
   update_requested_ = false;
-  if (sda_pin_ >= 0 && scl_pin_ >= 0) {
-    ESP_LOGCONFIG(TAG, "PN532 initialized (SDA=%d SCL=%d).", sda_pin_, scl_pin_);
-  } else {
-    ESP_LOGCONFIG(TAG, "PN532 initialized (SDA/SCL pins not configured — bus recovery disabled).");
-  }
+  ESP_LOGCONFIG(TAG, "PN532 initialized.");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -678,11 +603,8 @@ void DesfireReaderComponent::loop() {
 
     const uint8_t detect_cmd[] = {PN532_CMD_IN_LIST_PASSIVE, 0x01, 0x00};
     if (!this->write_command_(detect_cmd, sizeof(detect_cmd))) {
-      recover_i2c_bus_();
-      pn532_wakeup_();
-      state_ = NfcState::BUS_RECOVERY;
-      state_entered_at_ = millis();
-      cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
+      ESP_LOGW(TAG, "InListPassiveTarget send failed");
+      reset_to_idle_(note_silent_exchange_());
       return;
     }
     state_ = NfcState::DETECT_WAIT_ACK;
@@ -710,7 +632,7 @@ void DesfireReaderComponent::loop() {
       if (no_card_count_ < 255) no_card_count_++;
       if (no_card_count_ >= NO_CARD_THRESHOLD && card_present_)
         clear_card_state_();
-      reset_to_idle_(50);
+      reset_to_idle_(note_silent_exchange_());
     }
     return;
   }
@@ -749,8 +671,13 @@ void DesfireReaderComponent::loop() {
 
         current_uid_len_ = 0;
         current_uid_str_[0] = '\0';
-        if (!same_uid)
+        // Fail counters follow the card, so a rejected card backs off
+        // instead of being retried every 100 ms
+        if (!same_uid) {
           nonauthorised_fail_count_ = 0;
+          consecutive_fails_ = 0;
+          retry_count_ = 0;
+        }
 
         if (uid_len > 0 && uid_ptr != nullptr) {
           memcpy(prev_uid_, uid_ptr, uid_len);
@@ -761,8 +688,6 @@ void DesfireReaderComponent::loop() {
           ESP_LOGI(TAG, "UID: %s", current_uid_str_);
         }
         card_present_ = true;
-        consecutive_fails_ = 0;
-        retry_count_ = 0;
         ESP_LOGI(TAG, "New card — starting DESFire EV2 workflow");
 
         start_select_app_();
@@ -780,7 +705,7 @@ void DesfireReaderComponent::loop() {
       if (no_card_count_ < 255) no_card_count_++;
       if (no_card_count_ >= NO_CARD_THRESHOLD && card_present_)
         clear_card_state_();
-      reset_to_idle_(50);
+      reset_to_idle_(note_silent_exchange_());
     }
     return;
   }
@@ -804,7 +729,14 @@ void DesfireReaderComponent::loop() {
     uint8_t resp[8];
     uint8_t resp_len, sw1, sw2;
 
-    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
+    ApduResult r = read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2);
+    if (r == ApduResult::PN532_ERROR) {
+      ESP_LOGW(TAG, "SelectApp: PN532 RF error");
+      note_nonauthorised_failure_();
+      handle_retry_();
+      return;
+    }
+    if (r == ApduResult::OK) {
       if (sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK) {
         ESP_LOGD(TAG, "SelectApp OK");
 
@@ -858,7 +790,14 @@ void DesfireReaderComponent::loop() {
     uint8_t resp1[32];
     uint8_t resp1_len, sw1, sw2;
 
-    if (read_desfire_apdu_(resp1, sizeof(resp1), resp1_len, sw1, sw2)) {
+    ApduResult r = read_desfire_apdu_(resp1, sizeof(resp1), resp1_len, sw1, sw2);
+    if (r == ApduResult::PN532_ERROR) {
+      ESP_LOGW(TAG, "Auth1: PN532 RF error");
+      note_nonauthorised_failure_();
+      handle_retry_();
+      return;
+    }
+    if (r == ApduResult::OK) {
       if (sw2 != DESFIRE_MORE_FRAMES || resp1_len != 16) {
         ESP_LOGE(TAG, "Auth1 bad response (sw2=0x%02X, len=%d)", sw2, resp1_len);
         handle_retry_();
@@ -936,7 +875,14 @@ void DesfireReaderComponent::loop() {
     uint8_t resp2[48];
     uint8_t resp2_len, sw1, sw2;
 
-    if (read_desfire_apdu_(resp2, sizeof(resp2), resp2_len, sw1, sw2)) {
+    ApduResult r = read_desfire_apdu_(resp2, sizeof(resp2), resp2_len, sw1, sw2);
+    if (r == ApduResult::PN532_ERROR) {
+      ESP_LOGW(TAG, "Auth2: PN532 RF error");
+      note_nonauthorised_failure_();
+      handle_retry_();
+      return;
+    }
+    if (r == ApduResult::OK) {
       if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
         ESP_LOGE(TAG, "AES auth FAILED — wrong app key? (sw2=0x%02X)", sw2);
         if (current_uid_str_[0] != '\0')
@@ -1024,7 +970,13 @@ void DesfireReaderComponent::loop() {
     uint8_t resp[64];
     uint8_t resp_len, sw1, sw2;
 
-    if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
+    ApduResult r = read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2);
+    if (r == ApduResult::PN532_ERROR) {
+      ESP_LOGW(TAG, "ReadFile: PN532 RF error");
+      handle_retry_();
+      return;
+    }
+    if (r == ApduResult::OK) {
       if (!(sw1 == DESFIRE_SW1 && sw2 == DESFIRE_OK)) {
         ESP_LOGE(TAG, "ReadFile FAILED (sw1=0x%02X sw2=0x%02X)", sw1, sw2);
         handle_retry_();
@@ -1192,49 +1144,6 @@ void DesfireReaderComponent::loop() {
     return;
   }
 
-  // ─────────────────────────────────────────────
-  case NfcState::RELEASE_WAIT_ACK: {
-    if (try_read_ack_()) {
-      state_ = NfcState::RELEASE_WAIT_RESP;
-      state_entered_at_ = millis();
-      return;
-    }
-    if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
-      ESP_LOGD(TAG, "Release ACK timeout — recovering bus");
-      recover_i2c_bus_();
-      pn532_wakeup_();
-      prev_uid_len_ = 0;
-      state_ = NfcState::BUS_RECOVERY;
-      state_entered_at_ = millis();
-      cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
-    }
-    return;
-  }
-
-  // ─────────────────────────────────────────────
-  case NfcState::RELEASE_WAIT_RESP: {
-    uint8_t resp[4];
-    uint8_t resp_len;
-
-    if (try_read_response_(PN532_CMD_IN_RELEASE, resp, sizeof(resp), resp_len)) {
-      ESP_LOGD(TAG, "Target released — re-detecting");
-      prev_uid_len_ = 0;
-      reset_to_idle_(COOLDOWN_RETRY_MS);
-      return;
-    }
-
-    if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGD(TAG, "Release resp timeout — recovering bus");
-      recover_i2c_bus_();
-      pn532_wakeup_();
-      prev_uid_len_ = 0;
-      state_ = NfcState::BUS_RECOVERY;
-      state_entered_at_ = millis();
-      cooldown_until_ = millis() + COOLDOWN_RETRY_MS;
-    }
-    return;
-  }
-
   }  // end switch
 }
 
@@ -1246,11 +1155,6 @@ void DesfireReaderComponent::dump_config() {
                 comm_mode_ == CommMode::FULL ? "Full (encrypted+CMAC)" :
                 comm_mode_ == CommMode::MAC  ? "MAC (integrity)" : "Plain (legacy)");
   ESP_LOGCONFIG(TAG, "  Data key: %s", has_data_key_ ? "configured" : "not set");
-  if (sda_pin_ >= 0 && scl_pin_ >= 0) {
-    ESP_LOGCONFIG(TAG, "  SDA: GPIO%d  SCL: GPIO%d", sda_pin_, scl_pin_);
-  } else {
-    ESP_LOGCONFIG(TAG, "  SDA/SCL: not configured (bus recovery disabled)");
-  }
   ESP_LOGCONFIG(TAG, "  Retries: %d", MAX_RETRIES);
   LOG_I2C_DEVICE(this);
 }

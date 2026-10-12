@@ -11,8 +11,6 @@
 
 #ifdef USE_ESP32
 #include <esp_random.h>
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
 #endif
 
 namespace esphome {
@@ -26,7 +24,6 @@ static const uint8_t DESFIRE_MORE_FRAMES = 0xAF;
 
 static const uint8_t PN532_CMD_IN_DATA_EXCHANGE = 0x40;
 static const uint8_t PN532_CMD_IN_LIST_PASSIVE = 0x4A;
-static const uint8_t PN532_CMD_IN_RELEASE = 0x52;
 // Must be uint16_t: a uint8_t constant wraps silently to 0 if set above 255,
 // causing immediate stack corruption. 128 bytes gives comfortable headroom
 // over the 64-byte max used by current APDUs and prevents silent truncation
@@ -39,6 +36,9 @@ static const uint16_t COOLDOWN_FAIL_BASE_MS = 100;
 static const uint32_t COOLDOWN_FAIL_MAX_MS = 5000;
 static const uint8_t NO_CARD_THRESHOLD = 2;
 static const uint8_t MAX_RETRIES = 2;
+// Consecutive exchanges without a valid PN532 frame before the reader backs
+// off hard and logs an error
+static const uint8_t SILENT_EXCHANGE_LIMIT = 5;
 
 // File communication modes (matches DESFire spec)
 enum class CommMode : uint8_t {
@@ -69,8 +69,13 @@ enum class NfcState : uint8_t {
   READ_WAIT_ACK,
   READ_WAIT_RESP,
   PUBLISH,
-  RELEASE_WAIT_ACK,
-  RELEASE_WAIT_RESP,
+};
+
+// Outcome of reading a DESFire response frame from the PN532
+enum class ApduResult : uint8_t {
+  NOT_READY,    // No valid frame yet (or malformed frame)
+  OK,           // Exchange succeeded, SW1/SW2 are valid
+  PN532_ERROR,  // PN532 returned a non-zero status (RF error, card lost, ...)
 };
 
 class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
@@ -112,9 +117,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
     nonauthorised_uid_sensor_ = s;
   }
 
-  void set_sda_pin(int pin) { sda_pin_ = pin; }
-  void set_scl_pin(int pin) { scl_pin_ = pin; }
-
   void set_comm_mode(CommMode m) { comm_mode_ = m; }
 
  protected:
@@ -123,11 +125,13 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   bool try_read_ack_();
   bool try_read_response_(uint8_t command, uint8_t *resp, uint8_t resp_cap,
                           uint8_t &resp_len);
+  void pn532_responded_();
+  uint32_t note_silent_exchange_();
 
   // ── DESFire APDU helpers ──
   bool send_desfire_apdu_(const uint8_t *apdu, uint8_t apdu_len);
-  bool read_desfire_apdu_(uint8_t *response, uint8_t resp_cap,
-                          uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
+  ApduResult read_desfire_apdu_(uint8_t *response, uint8_t resp_cap,
+                                uint8_t &resp_len, uint8_t &sw1, uint8_t &sw2);
 
   // ── AES helpers ──
   bool aes_cbc_decrypt_with_key_(const uint8_t *rk, const uint8_t *in,
@@ -156,11 +160,10 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   void handle_fail_();
   void handle_retry_();
   void reset_to_idle_(uint32_t cooldown_ms);
+  void wipe_session_();
   void clear_card_state_();
-  void start_release_();
   void start_select_app_();
   void start_read_file_();
-  void recover_i2c_bus_();
   void pn532_wakeup_();
 
   // ── Configuration ──
@@ -171,9 +174,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t data_rk_[176]{};
   bool has_data_key_{false};
   CommMode comm_mode_{CommMode::PLAIN};
-
-  int sda_pin_{-1};
-  int scl_pin_{-1};
 
   // ── Sensors ──
   text_sensor::TextSensor *result_sensor_{nullptr};
@@ -199,6 +199,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t consecutive_fails_{0};
   uint8_t retry_count_{0};
   uint8_t nonauthorised_fail_count_{0};
+  uint8_t silent_exchanges_{0};  // Exchanges since the PN532 last returned a valid frame
 
   // ── Card interaction buffers ──
   char current_uid_str_[24]{};
@@ -223,7 +224,6 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   static const uint16_t ACK_TIMEOUT_MS = 50;
   static const uint16_t RESP_TIMEOUT_MS = 150;
   static const uint16_t DETECT_TIMEOUT_MS = 200;
-  static const uint16_t BUS_RECOVERY_MS = 30;
 };
 
 }  // namespace desfire_reader
