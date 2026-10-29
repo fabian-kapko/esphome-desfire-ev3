@@ -66,7 +66,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/fabian-kapko/esphome-desfire-ev3
-      ref: main
+      ref: master
 
 desfire_reader:
   id: my_reader
